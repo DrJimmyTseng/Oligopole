@@ -9,3 +9,10 @@
 - **`persona.rs`:** `PersonaBiasVector`, log-odds softmax modulation in `rust_decimal`, Hamilton basis-point normalization, and seeded `ChaCha8Rng` sampling.
 - **`protocol.rs` & `client.rs`:** Length-prefixed `msgpack` wire protocol (`noul`, `choice`, `score`) and advisory RTX 5090 `PingHandshake`.
 - **`system0.rs`:** Pure-Rust NPV & persona heuristic evaluator for 10,000-tick headless Monte Carlo benchmarks and offline tests.
+
+## 3. Invariants Verified by `proptest` & Integration Tests
+1. `modulate_and_sample_choice` normalizes log-odds shifted weights via `allocate_hamilton` to exact basis points summing to `10_000` and samples reproducibly from `seeded_actor_rng`.
+2. `ClefFlashTcpClient` verifies `TCP_NODELAY` 4-byte big-endian length-prefixed `msgpack` framing (`PingHandshake` with advisory RTX 5090 device check and `EvaluateSlowTickBatch`).
+
+## 4. Status
+- **Status:** Complete & Verified (`2/2` unit and `proptest` suites passing, zero Clippy warnings).
