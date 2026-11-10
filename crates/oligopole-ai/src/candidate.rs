@@ -1,6 +1,6 @@
 use crate::error::AiError;
 use crate::observation::ActorObservationView;
-use oligopole_core::JointCapitalAction;
+use oligopole_core::{JointCapitalAction, decimal_bytes_serde};
 use oligopole_ledger::Money;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -13,7 +13,9 @@ pub struct CandidateOption {
     pub label: String,
     pub action: JointCapitalAction,
     pub estimated_npv: Money,
+    #[serde(with = "decimal_bytes_serde")]
     pub risk_weight: Decimal,
+    #[serde(with = "decimal_bytes_serde")]
     pub leverage_weight: Decimal,
 }
 

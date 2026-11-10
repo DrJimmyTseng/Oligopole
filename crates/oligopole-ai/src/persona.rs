@@ -1,5 +1,5 @@
 use crate::error::AiError;
-use oligopole_core::pade_exp_neg;
+use oligopole_core::{decimal_bytes_serde, pade_exp_neg};
 use oligopole_ledger::{Money, allocate_hamilton};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -11,9 +11,13 @@ use serde::{Deserialize, Serialize};
 /// in log-odds space before deterministic `ChaCha8Rng` sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersonaBiasVector {
+    #[serde(with = "decimal_bytes_serde")]
     pub risk_appetite: Decimal,
+    #[serde(with = "decimal_bytes_serde")]
     pub leverage_tolerance: Decimal,
+    #[serde(with = "decimal_bytes_serde")]
     pub price_aggression: Decimal,
+    #[serde(with = "decimal_bytes_serde")]
     pub shareholder_yield_bias: Decimal,
 }
 

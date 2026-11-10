@@ -293,17 +293,54 @@ impl WorldState {
             }
         }
 
-        // 2. Apply pricing, wage, and dividend policy dials
+        // 2. Apply pricing, wage, and dividend policy dials with role-specific competitive reference band clamping
+        let ref_price = self
+            .corporations
+            .get(corp_id)
+            .map_or(Money::from_dollars(100), |c| match c.role {
+                CorporationRole::ResourceExtractor { output_sku } => self
+                    .skus
+                    .get(output_sku)
+                    .map_or(Money::from_dollars(42), |s| s.base_reference_price),
+                CorporationRole::Manufacturer { output_sku, .. } => {
+                    // Wholesale manufacturer reference price is 60% of finished retail SKU reference price
+                    let retail_ref = self
+                        .skus
+                        .get(output_sku)
+                        .map_or(Money::from_dollars(220), |s| s.base_reference_price);
+                    Money::from_cents((retail_ref.cents() * 60) / 100)
+                }
+                CorporationRole::Retailer { retail_sku } => self
+                    .skus
+                    .get(retail_sku)
+                    .map_or(Money::from_dollars(220), |s| s.base_reference_price),
+            });
+
         if let Some(corp) = self.corporations.get_mut(corp_id) {
             if !corp.delegation.is_player_controlled || corp.delegation.delegate_pricing_to_ai {
-                corp.posted_selling_price =
-                    apply_pricing_stance(corp.posted_selling_price, reconciled.pricing_stance)?;
+                let raw_new_price = match reconciled.pricing_stance {
+                    crate::command::PricingStance::MatchMarket => {
+                        Money::from_cents(i128::midpoint(
+                            corp.posted_selling_price.cents(),
+                            ref_price.cents(),
+                        ))
+                    }
+                    other => apply_pricing_stance(corp.posted_selling_price, other)?,
+                };
+                let min_band = Money::from_cents((ref_price.cents() * 75) / 100);
+                let max_band = Money::from_cents((ref_price.cents() * 125) / 100);
+                corp.posted_selling_price = raw_new_price.clamp(min_band, max_band);
+                // Scale input willingness-to-pay proportionally (80% of output selling price)
+                corp.max_input_bid_price =
+                    Money::from_cents((corp.posted_selling_price.cents() * 80) / 100);
             }
             if !corp.delegation.is_player_controlled
                 || corp.delegation.delegate_capex_and_financing_to_ai
             {
-                corp.daily_wage_bill =
+                let raw_wage =
                     apply_wage_stance(corp.daily_wage_bill, reconciled.wage_stance)?;
+                corp.daily_wage_bill =
+                    raw_wage.clamp(Money::from_dollars(500), Money::from_dollars(8_000));
                 corp.target_dividend_payout_bps = reconciled.dividend_stance.payout_bps();
             }
         }

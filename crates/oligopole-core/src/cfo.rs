@@ -62,16 +62,21 @@ pub fn reconcile_strategic_directive(
             loan_principal,
             ..
         } => {
+            // Enforce maximum debt-to-cash & working-capital leverage covenant
+            let max_leverage_ceiling = working_capital_floor.checked_mul_u64(8)?;
             let net_cash_needed = if *capex_cost > *loan_principal {
                 capex_cost.checked_sub(*loan_principal)?
             } else {
                 Money::ZERO
             };
-            if net_cash_needed <= free_cash_above_floor {
+            if outstanding_debt < max_leverage_ceiling && net_cash_needed <= free_cash_above_floor {
                 cash_after_capex = free_cash_above_floor.checked_sub(net_cash_needed)?;
             } else {
+                let safe_repay = Money::from_cents(free_cash_above_floor.cents() / 3)
+                    .min(outstanding_debt);
+                cash_after_capex = free_cash_above_floor.checked_sub(safe_repay)?;
                 directive.capital_action = JointCapitalAction::HoldAndDelever {
-                    repay_amount: Money::ZERO,
+                    repay_amount: safe_repay,
                 };
             }
         }

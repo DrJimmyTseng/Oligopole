@@ -29,7 +29,9 @@ pub use command::{
     WageStance,
 };
 pub use error::CoreError;
-pub use household::{HouseholdCohort, HouseholdCohortKind, RetailStoreOffer, pade_exp_neg};
+pub use household::{
+    HouseholdCohort, HouseholdCohortKind, RetailStoreOffer, decimal_bytes_serde, pade_exp_neg,
+};
 pub use ids::{CohortId, ContractId, CorpId, InstrumentId, OrderId, SkuId};
 pub use production::{
     AiDelegationConfig, Corporation, CorporationRole, SkuDefinition,

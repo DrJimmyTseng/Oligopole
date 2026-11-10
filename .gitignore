@@ -25,3 +25,8 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local Specs & Instructions
+GEMINI.md
+**/GEMINI.md
+

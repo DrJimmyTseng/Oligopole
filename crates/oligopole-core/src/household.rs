@@ -49,6 +49,21 @@ pub fn pade_exp_neg(x: Decimal) -> Result<Decimal, CoreError> {
     Ok(y.clamp(dec!(0.000_000_001), Decimal::ONE))
 }
 
+/// Deterministic 16-byte binary `serde` adapter for `rust_decimal::Decimal` compatible with `postcard`.
+pub mod decimal_bytes_serde {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(val: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
+        val.serialize().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
+        let bytes = <[u8; 16]>::deserialize(deserializer)?;
+        Ok(Decimal::deserialize(bytes))
+    }
+}
+
 /// Stratified macroeconomic household income cohorts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HouseholdCohortKind {
@@ -79,8 +94,11 @@ pub struct HouseholdCohort {
     pub savings_subsistence_floor: Money,
     /// Daily fraction of excess disposable cash spent on retail consumption (`bps` out of `10_000`).
     pub daily_mpc_bps: u32,
+    #[serde(with = "decimal_bytes_serde")]
     pub price_sensitivity: Decimal,
+    #[serde(with = "decimal_bytes_serde")]
     pub quality_affinity: Decimal,
+    #[serde(with = "decimal_bytes_serde")]
     pub brand_affinity: Decimal,
 }
 

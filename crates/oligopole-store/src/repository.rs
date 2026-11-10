@@ -461,6 +461,14 @@ mod tests {
             assert!(inc_a >= inc_b);
         }
 
+        // Verify full zstd(postcard) snapshot decompression roundtrip
+        let (loaded_world, loaded_hash) = store.load_latest_snapshot().unwrap();
+        assert_eq!(loaded_world.current_tick.0, 60);
+        assert_eq!(
+            compute_world_blake3_hash(&loaded_world).unwrap(),
+            loaded_hash
+        );
+
         // Verify bit-for-bit deterministic replay from a fresh Genesis world
         let (fresh_genesis, _) = build_vertical_slice_0(seed).unwrap();
         let verified_checkpoints = store.verify_deterministic_replay(fresh_genesis).unwrap();
