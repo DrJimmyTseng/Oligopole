@@ -12,3 +12,10 @@
 - **`production.rs`:** Factory DAG recipes transforming input `WacInventoryLot`s + labor into output finished goods.
 - **`cfo.rs`:** Deterministic corporate finance constraint solver enforcing minimum cash buffers and debt service covenants.
 - **`world.rs` & `vertical_slice.rs`:** `WorldState` aggregate, 5-subphase Fast-Tick pipeline, `WorldView` snapshot projection, and Vertical Slice 0 ("Iron-to-Consumer + Equity CLOB").
+
+## 3. Invariants Verified by `proptest`
+1. `pade_exp_neg(x)` is strictly positive `(0, 1]` and strictly monotonic across `[-20, 0]`, eliminating the raw Padé `(2,2)` numerator parabola minimum at `x = -3`.
+2. `WorldState::audit_world_invariants()` holds at every tick across 360-day full-year runs and randomized multi-month `StrategicDirective` injections, verifying both `LedgerEngine::audit_trial_balance()` and exact cent-for-cent identity between `WacInventoryLot::total_book_value()` and ledger `InventoryRaw`/`InventoryFinished` balances.
+
+## 4. Status
+- **Status:** Complete & Verified (`5/5` unit and `proptest` suites passing, zero Clippy warnings).

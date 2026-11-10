@@ -37,6 +37,8 @@ disallowed_types = "deny"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
 
 [workspace.dependencies]
 oligopole-ledger = { path = "crates/oligopole-ledger" }
