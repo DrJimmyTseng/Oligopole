@@ -106,9 +106,18 @@ fn run_cli() -> Result<(), String> {
             let mut save_path: Option<String> = None;
             let mut connect_url: Option<String> = None;
             let mut session_token = String::from("PLYR-TOKEN");
+            let mut seed_byte: u8 = 42;
             let mut idx = 1usize;
             while idx < args.len() {
                 match args.get(idx).map(String::as_str) {
+                    Some("--seed") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            seed_byte = val.parse::<u8>().map_err(|e| e.to_string())?;
+                            idx += 2;
+                        } else {
+                            return Err("--seed requires a byte (0..=255)".to_owned());
+                        }
+                    }
                     Some("--clef-flash") => {
                         let next_is_addr = args
                             .get(idx + 1)
@@ -151,7 +160,7 @@ fn run_cli() -> Result<(), String> {
             if let Some(url) = connect_url {
                 launch_remote_terminal(&url, &session_token)
             } else {
-                run_terminal(clef_addr.as_deref(), save_path.as_deref())
+                run_terminal(clef_addr.as_deref(), save_path.as_deref(), seed_byte)
             }
         }
         "serve" => {
@@ -352,8 +361,8 @@ fn run_verify_replay(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_terminal(clef_addr: Option<&str>, save_path: Option<&str>) -> Result<(), String> {
-    let (world, _) = build_vertical_slice_0([42u8; 32]).map_err(|e| e.to_string())?;
+fn run_terminal(clef_addr: Option<&str>, save_path: Option<&str>, seed_byte: u8) -> Result<(), String> {
+    let (world, _) = build_vertical_slice_0([seed_byte; 32]).map_err(|e| e.to_string())?;
     launch_native_terminal(world, clef_addr, save_path)
 }
 
