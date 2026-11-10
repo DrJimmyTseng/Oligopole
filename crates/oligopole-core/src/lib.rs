@@ -34,7 +34,7 @@ pub use household::{
 };
 pub use ids::{CohortId, ContractId, CorpId, InstrumentId, OrderId, SkuId};
 pub use production::{
-    AiDelegationConfig, Corporation, CorporationRole, SkuDefinition,
+    AiDelegationConfig, Corporation, CorporationRole, ExecutivePersonaKind, SkuDefinition,
 };
 pub use retail_market::{RetailSaleSettlement, compute_retail_clearing_plan};
 pub use snapshot::{CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, WorldView};

@@ -64,6 +64,24 @@ pub fn generate_joint_action_candidates(
     let campaign_cost = Money::from_dollars(20_000);
     let npv_campaign = Money::from_cents(gross_180d.cents() / 3).checked_sub(campaign_cost)?;
 
+    let excess_90d = daily_burn.checked_mul_u64(90)?;
+    let surplus_above_90d = if obs.available_cash > excess_90d {
+        obs.available_cash.checked_sub(excess_90d)?
+    } else {
+        Money::ZERO
+    };
+    let buyback_budget =
+        Money::from_cents(surplus_above_90d.cents() / 4).min(Money::from_dollars(25_000));
+    let buyback_max_px = Money::from_cents(((obs.share_price.cents() * 103) / 100).max(200));
+    let buyback_npv = if buyback_budget.is_positive() && obs.book_value_per_share >= obs.share_price
+    {
+        Money::from_cents(buyback_budget.cents() / 3)
+    } else if buyback_budget.is_positive() {
+        Money::from_cents(buyback_budget.cents() / 8)
+    } else {
+        Money::from_dollars(-50_000)
+    };
+
     let candidates = vec![
         CandidateOption {
             label: "HOLD_AND_DELEVER".to_owned(),
@@ -108,6 +126,16 @@ pub fn generate_joint_action_candidates(
             estimated_npv: npv_campaign,
             risk_weight: dec!(0.3),
             leverage_weight: dec!(0.0),
+        },
+        CandidateOption {
+            label: "REPURCHASE_SHARES".to_owned(),
+            action: JointCapitalAction::RepurchaseShares {
+                buyback_budget,
+                max_limit_price: buyback_max_px,
+            },
+            estimated_npv: buyback_npv,
+            risk_weight: dec!(-0.2),
+            leverage_weight: dec!(-0.4),
         },
     ];
 

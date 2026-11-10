@@ -29,6 +29,37 @@ pub enum CorporationRole {
     Retailer { retail_sku: SkuId },
 }
 
+/// Executive persona archetype distinguishing corporate leadership behavior across the 6 firms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExecutivePersonaKind {
+    /// Balanced player-controlled or neutral steward.
+    BalancedExecutive,
+    /// Conservative dividend aristocrat prioritizing balance-sheet fortress and high shareholder payouts.
+    DividendAristocrat,
+    /// Aggressive debt-funded capacity builder pursuing volume dominance.
+    AggressiveEmpireBuilder,
+    /// Quality & brand moat compounding specialist defending premium gross margins.
+    QualityMoatCompounder,
+    /// Lean cost-cutting & undercut specialist competing on price velocity.
+    CostUndercutChallenger,
+    /// Opportunistic share-cannibal & capital allocator balancing high ROE with aggressive buybacks.
+    OpportunisticCapitalAllocator,
+}
+
+impl ExecutivePersonaKind {
+    #[inline]
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            Self::BalancedExecutive => "BALANCED STEWARD",
+            Self::DividendAristocrat => "DIVIDEND ARISTOCRAT",
+            Self::AggressiveEmpireBuilder => "EMPIRE BUILDER",
+            Self::QualityMoatCompounder => "MOAT COMPOUNDER",
+            Self::CostUndercutChallenger => "PRICE CHALLENGER",
+            Self::OpportunisticCapitalAllocator => "CAPITAL ALLOCATOR",
+        }
+    }
+}
+
 /// Executive AI delegation switches allowing the Player (or Rival CEOs) to delegate specific domains to `Clef-Flash`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiDelegationConfig {
@@ -56,6 +87,15 @@ impl AiDelegationConfig {
             delegate_procurement_to_ai: false,
         }
     }
+
+    /// Returns `true` if at least one Slow-Tick strategic domain (`pricing` or `capex_and_financing`)
+    /// is delegated to the AI policy engine.
+    #[inline]
+    pub const fn accepts_slow_tick_ai(self) -> bool {
+        !self.is_player_controlled
+            || self.delegate_pricing_to_ai
+            || self.delegate_capex_and_financing_to_ai
+    }
 }
 
 /// Corporation aggregate root combining operational facilities, WAC inventory lots,
@@ -68,6 +108,7 @@ pub struct Corporation {
     pub ticker: String,
     pub name: String,
     pub role: CorporationRole,
+    pub persona_kind: ExecutivePersonaKind,
     pub delegation: AiDelegationConfig,
     /// Daily batch capacity (batches/day for extractors & manufacturers; max daily replenishment units for retailers).
     pub daily_capacity: u64,
@@ -93,6 +134,8 @@ pub struct Corporation {
     pub monthly_units_output: u64,
     /// Cumulative units sold in the current month.
     pub monthly_units_sold: u64,
+    /// Trailing monthly dividend paid (for secondary Equity CLOB dividend-yield valuation).
+    pub last_monthly_dividend_paid: Money,
 }
 
 impl Corporation {

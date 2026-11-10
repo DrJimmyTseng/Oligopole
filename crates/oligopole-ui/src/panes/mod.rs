@@ -410,6 +410,18 @@ impl TerminalPane {
                 .color(AMBER_PRIMARY)
                 .strong(),
         );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("PERSONA: {}", corp.persona_kind.badge_label()))
+                    .color(CYAN_ACCENT)
+                    .strong(),
+            );
+            ui.separator();
+            ui.label(format!(
+                "Shares Out: {} | Mkt Cap: {}",
+                corp.total_shares_outstanding, corp.market_cap
+            ));
+        });
 
         ui.horizontal(|ui| {
             ui.label(format!("Current Selling Price: {}", corp.posted_selling_price));
@@ -448,7 +460,19 @@ impl TerminalPane {
         });
 
         ui.separator();
-        ui.label(RichText::new("AI COO/CFO DELEGATION (`Clef-Flash` / `System0`)").color(EMERALD_ACCENT));
+        let mode_badge = if corp.delegation.accepts_slow_tick_ai() {
+            "MODE: AI AUTOPILOT ACTIVE"
+        } else {
+            "MODE: MANUAL EXECUTIVE CONTROL"
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("AI COO/CFO DELEGATION (`Clef-Flash` / `System0`)")
+                    .color(EMERALD_ACCENT),
+            );
+            ui.separator();
+            ui.label(RichText::new(mode_badge).color(AMBER_PRIMARY).strong());
+        });
         let mut del_price = corp.delegation.delegate_pricing_to_ai;
         let mut del_capex = corp.delegation.delegate_capex_and_financing_to_ai;
         let mut del_proc = corp.delegation.delegate_procurement_to_ai;
@@ -457,6 +481,18 @@ impl TerminalPane {
             changed |= ui.checkbox(&mut del_price, "AI Pricing").changed();
             changed |= ui.checkbox(&mut del_capex, "AI CapEx/CFO").changed();
             changed |= ui.checkbox(&mut del_proc, "AI Procurement").changed();
+            if ui.button("Full Manual").clicked() {
+                del_price = false;
+                del_capex = false;
+                del_proc = false;
+                changed = true;
+            }
+            if ui.button("Full AI Autopilot").clicked() {
+                del_price = true;
+                del_capex = true;
+                del_proc = true;
+                changed = true;
+            }
         });
         if changed {
             let _ = cmd_tx.send(PlayerCommand::UpdateAiDelegation {
@@ -469,13 +505,16 @@ impl TerminalPane {
 
         if let Some(eq_id) = corp.equity_instrument_id {
             ui.separator();
-            ui.label(RichText::new("SUBMIT EQUITY CLOB LIMIT ORDER").color(AMBER_PRIMARY));
+            ui.label(
+                RichText::new("CORPORATE SHARE BUYBACK / SECONDARY EQUITY CLOB")
+                    .color(AMBER_PRIMARY),
+            );
             ui.horizontal(|ui| {
                 ui.label("Qty:");
                 ui.add(egui::DragValue::new(&mut self.order_qty_input).range(1..=10_000));
                 ui.label("Limit ($):");
                 ui.add(egui::DragValue::new(&mut self.order_price_dollars).range(1..=10_000));
-                if ui.button("BUY (BID)").clicked() {
+                if ui.button("BUYBACK SHARES (BID)").clicked() {
                     let _ = cmd_tx.send(PlayerCommand::SubmitClobOrder {
                         trader_entity_id: corp.entity_id,
                         instrument_id: eq_id,

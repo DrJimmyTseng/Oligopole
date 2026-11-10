@@ -80,6 +80,16 @@ pub enum JointCapitalAction {
         duration_days: u32,
         estimated_npv: Money,
     },
+    /// Execute a corporate share buyback on the secondary Equity CLOB to retire shares.
+    RepurchaseShares {
+        buyback_budget: Money,
+        max_limit_price: Money,
+    },
+    /// Issue new primary shares on the secondary Equity CLOB to raise equity capital.
+    IssueEquityShares {
+        shares_to_issue: u64,
+        min_ask_price: Money,
+    },
 }
 
 /// Complete monthly Slow-Tick strategic directive package for a single `CorpId`,

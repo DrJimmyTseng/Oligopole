@@ -7,7 +7,7 @@
 - **`theme.rs`:** High-contrast Bloomberg Amber/Cyan/Emerald/Dark-Matrix palette and tabular monospace styling.
 - **`command_bar.rs`:** Keyboard-first `<TICKER> <MARKET> <MNEMONIC>` parser (e.g., `IRON CMDTY GP`, `ACME EQ FA`, `ACME EQ OB`, `PLAYER EQ OPS`) and `F1–F12` workspace hotkeys.
 - **`channel_link.rs`:** Color-coded pane linking (`Channel A`, `Channel B`, `Channel C`, `Unlinked`) synchronizing active instruments across docked panes.
-- **`app.rs` & `panes/`:** `OligopoleTerminalApp` managing `egui_tiles::Tree` across Market Monitor, OHLCV Price Charts (`GP`), Level-2 Order Book (`OB`), Financial Statements (`FA`), Supply-Chain WAC DAG (`OPS`), and Executive Command & AI Delegation Ticket.
+- **`app.rs` & `panes/`:** `OligopoleTerminalApp` managing `egui_tiles::Tree` across Market Monitor, OHLCV Price Charts (`GP`), Level-2 Order Book (`OB`), Financial Statements (`FA`), Supply-Chain WAC DAG (`OPS`), and Executive Command & AI Delegation Ticket (`EX`), plus live `[AI: CLEF-FLASH RTX 5090 (BF16)]` / `[AI: SYSTEM-0 HEURISTIC (CPU)]` backend badge, `ExecutivePersonaKind` display, and `PLYR` Manual vs. AI Autopilot delegation enforcement.
 
 ## 3. Status
-- **Status:** Complete & Verified (Command bar parser unit tests passing, zero Clippy warnings, frame-budgeted 120 Hz `watch<Arc<WorldView>>` publisher integrated).
+- **Status:** Complete & Verified (Command bar parser unit tests passing, zero Clippy warnings, frame-budgeted 120 Hz `watch<Arc<WorldView>>` and `watch<AiBackendStatus>` publishers integrated).

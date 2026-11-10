@@ -32,6 +32,9 @@ pub struct ActorObservationView {
     pub competitor_average_price: Money,
     pub input_market_price: Money,
     pub bank_loan_rate_bps: u32,
+    pub share_price: Money,
+    pub total_shares_outstanding: u64,
+    pub book_value_per_share: Money,
 }
 
 impl ActorObservationView {
@@ -48,6 +51,14 @@ impl ActorObservationView {
             .entity_balance(corp.entity_id, StandardAccountCode::LoansPayable)?;
         let report =
             FinancialStatementReport::generate(&world.ledger, corp.entity_id, world.current_tick.0)?;
+        let share_price = corp
+            .equity_instrument_id
+            .and_then(|id| world.order_books.get(id))
+            .map_or(Money::from_dollars(25), |b| b.last_price);
+        let shares_i128 = i128::from(corp.total_shares_outstanding.max(1));
+        let book_value_per_share = Money::from_cents(
+            (report.total_equity_including_net_income.cents() / shares_i128).max(100),
+        );
 
         let primary_sku = match corp.role {
             CorporationRole::ResourceExtractor { output_sku }
@@ -123,13 +134,16 @@ impl ActorObservationView {
             competitor_average_price,
             input_market_price,
             bank_loan_rate_bps: world.bank.default_loan_rate_bps,
+            share_price,
+            total_shares_outstanding: corp.total_shares_outstanding,
+            book_value_per_share,
         })
     }
 
     /// Formats a compact, deterministic text dossier for `Clef-Flash` 9B single-pass prefill.
     pub fn to_clef_dossier(&self) -> String {
         format!(
-            "TICK={} CORP={} ROLE={:?} CASH={} DEBT={} NET_INC={} CAP={} INV={} OUT_30D={} SOLD_30D={} PRICE={} PEER_PRICE={} IN_COST={} LOAN_BPS={}",
+            "TICK={} CORP={} ROLE={:?} CASH={} DEBT={} NET_INC={} CAP={} INV={} OUT_30D={} SOLD_30D={} PRICE={} PEER_PRICE={} IN_COST={} LOAN_BPS={} SHARE_PX={} BVPS={} SHARES={}",
             self.tick.0,
             self.ticker,
             self.role,
@@ -143,7 +157,10 @@ impl ActorObservationView {
             self.posted_selling_price,
             self.competitor_average_price,
             self.input_market_price,
-            self.bank_loan_rate_bps
+            self.bank_loan_rate_bps,
+            self.share_price,
+            self.book_value_per_share,
+            self.total_shares_outstanding
         )
     }
 }

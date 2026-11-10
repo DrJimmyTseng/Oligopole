@@ -3,7 +3,7 @@ use crate::error::CoreError;
 use crate::household::{HouseholdCohort, HouseholdCohortKind};
 use crate::ids::{CohortId, CorpId, InstrumentId, SkuId};
 use crate::production::{
-    AiDelegationConfig, Corporation, CorporationRole, SkuDefinition,
+    AiDelegationConfig, Corporation, CorporationRole, ExecutivePersonaKind, SkuDefinition,
 };
 use crate::world::{EquityPosition, WorldState};
 use oligopole_ledger::{EntityId, Money, StandardAccountCode};
@@ -140,6 +140,7 @@ pub fn build_vertical_slice_0(
         CorporationRole::ResourceExtractor {
             output_sku: iron_ore_sku,
         },
+        ExecutivePersonaKind::DividendAristocrat,
         AiDelegationConfig::autonomous_rival(),
         Money::from_dollars(480_000),
         65,
@@ -161,6 +162,7 @@ pub fn build_vertical_slice_0(
         CorporationRole::ResourceExtractor {
             output_sku: iron_ore_sku,
         },
+        ExecutivePersonaKind::AggressiveEmpireBuilder,
         AiDelegationConfig::autonomous_rival(),
         Money::from_dollars(460_000),
         60,
@@ -185,6 +187,7 @@ pub fn build_vertical_slice_0(
             output_sku: appliance_sku,
             output_units_per_batch: 1,
         },
+        ExecutivePersonaKind::QualityMoatCompounder,
         AiDelegationConfig::autonomous_rival(),
         Money::from_dollars(650_000),
         55,
@@ -209,6 +212,7 @@ pub fn build_vertical_slice_0(
             output_sku: appliance_sku,
             output_units_per_batch: 1,
         },
+        ExecutivePersonaKind::CostUndercutChallenger,
         AiDelegationConfig::autonomous_rival(),
         Money::from_dollars(600_000),
         50,
@@ -230,6 +234,7 @@ pub fn build_vertical_slice_0(
         CorporationRole::Retailer {
             retail_sku: appliance_sku,
         },
+        ExecutivePersonaKind::BalancedExecutive,
         AiDelegationConfig {
             is_player_controlled: true,
             delegate_pricing_to_ai: true,
@@ -256,6 +261,7 @@ pub fn build_vertical_slice_0(
         CorporationRole::Retailer {
             retail_sku: appliance_sku,
         },
+        ExecutivePersonaKind::OpportunisticCapitalAllocator,
         AiDelegationConfig::autonomous_rival(),
         Money::from_dollars(550_000),
         55,
@@ -297,6 +303,7 @@ fn register_slice_corporation(
     ticker: &str,
     name: &str,
     role: CorporationRole,
+    persona_kind: ExecutivePersonaKind,
     delegation: AiDelegationConfig,
     initial_cash: Money,
     daily_capacity: u64,
@@ -323,6 +330,7 @@ fn register_slice_corporation(
         ticker: ticker.to_owned(),
         name: name.to_owned(),
         role,
+        persona_kind,
         delegation,
         daily_capacity,
         daily_wage_bill,
@@ -336,6 +344,7 @@ fn register_slice_corporation(
         inventory: BTreeMap::new(),
         monthly_units_output: 0,
         monthly_units_sold: 0,
+        last_monthly_dividend_paid: Money::ZERO,
     });
 
     let eq_ticker = format!("{ticker} EQ");

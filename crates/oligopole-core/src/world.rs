@@ -296,6 +296,18 @@ impl WorldState {
                     });
                 }
             }
+            JointCapitalAction::RepurchaseShares {
+                buyback_budget,
+                max_limit_price,
+            } => {
+                self.execute_share_buyback(corp_id, *buyback_budget, *max_limit_price)?;
+            }
+            JointCapitalAction::IssueEquityShares {
+                shares_to_issue,
+                min_ask_price,
+            } => {
+                self.execute_equity_issuance(corp_id, *shares_to_issue, *min_ask_price)?;
+            }
         }
 
         // 2. Apply pricing, wage, and dividend policy dials with role-specific competitive reference band clamping
@@ -467,6 +479,110 @@ impl WorldState {
                     .saturating_add(brand_boost_bps)
                     .min(20_000);
             }
+        }
+        Ok(())
+    }
+
+    fn execute_share_buyback(
+        &mut self,
+        corp_id: CorpId,
+        buyback_budget: Money,
+        max_limit_price: Money,
+    ) -> Result<(), CoreError> {
+        if !buyback_budget.is_positive() || !max_limit_price.is_positive() {
+            return Ok(());
+        }
+        let (entity_id, eq_inst_id) = {
+            let corp = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            let Some(eq_inst_id) = corp.equity_instrument_id else {
+                return Ok(());
+            };
+            (corp.entity_id, eq_inst_id)
+        };
+
+        self.cancel_all_orders_for_entity_on_book(eq_inst_id, entity_id)?;
+        let avail_cash = self.ledger.available_cash(entity_id)?;
+        let working_floor = match self.corporations.get(corp_id) {
+            Some(c) => {
+                let debt = self
+                    .bank
+                    .loans
+                    .get(&entity_id)
+                    .map_or(Money::ZERO, |l| l.principal_outstanding);
+                c.working_capital_floor(45, debt, self.bank.default_loan_rate_bps)?
+            }
+            None => Money::ZERO,
+        };
+        if avail_cash <= working_floor {
+            return Ok(());
+        }
+        let spendable = avail_cash.checked_sub(working_floor)?;
+        let budget = buyback_budget.min(spendable);
+        let qty_i128 = budget.checked_div_euclid(max_limit_price.cents())?.cents();
+        let qty = u64::try_from(qty_i128).unwrap_or(0);
+        if qty > 0 {
+            let (order_id, _) = self.submit_clob_limit_order(
+                entity_id,
+                eq_inst_id,
+                OrderSide::Bid,
+                max_limit_price,
+                qty,
+            )?;
+            // Immediate-or-Cancel (IOC) execution for corporate buybacks so operating cash is never locked indefinitely
+            let is_still_resting = self
+                .order_books
+                .get(eq_inst_id)
+                .is_some_and(|b| b.bids.values().any(|q| q.iter().any(|o| o.order_id == order_id)));
+            if is_still_resting {
+                let _ = self.cancel_clob_limit_order(eq_inst_id, order_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_equity_issuance(
+        &mut self,
+        corp_id: CorpId,
+        shares_to_issue: u64,
+        min_ask_price: Money,
+    ) -> Result<(), CoreError> {
+        if shares_to_issue == 0 || !min_ask_price.is_positive() {
+            return Ok(());
+        }
+        let (entity_id, eq_inst_id) = {
+            let corp = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            let Some(eq_inst_id) = corp.equity_instrument_id else {
+                return Ok(());
+            };
+            (corp.entity_id, eq_inst_id)
+        };
+
+        self.cancel_all_orders_for_entity_on_book(eq_inst_id, entity_id)?;
+        if let Some(corp) = self.corporations.get_mut(corp_id) {
+            corp.total_shares_outstanding = corp
+                .total_shares_outstanding
+                .saturating_add(shares_to_issue);
+        }
+        let pos = self
+            .equity_positions
+            .entry((corp_id, entity_id))
+            .or_default();
+        pos.owned_shares = pos.owned_shares.saturating_add(shares_to_issue);
+        let total_treasury = pos.available_shares();
+        if total_treasury > 0 {
+            self.submit_clob_limit_order(
+                entity_id,
+                eq_inst_id,
+                OrderSide::Ask,
+                min_ask_price,
+                total_treasury,
+            )?;
         }
         Ok(())
     }
@@ -713,9 +829,13 @@ impl WorldState {
                 self.ledger.post_entry(&entry)?;
             }
             InstrumentKind::Equity { corp_id } => {
-                // Secondary market equity transfer between seller and buyer:
-                // Seller transfers `fill.qty` reserved shares to Buyer; Buyer transfers `trade_notional` cash to Seller
-                // (recorded as CommonStock/RetainedEarnings/Cash transfer on their investment books).
+                // Secondary market equity transfer (or corporate share buyback / primary issuance):
+                // Seller transfers `fill.qty` reserved shares to Buyer; Buyer transfers `trade_notional` cash to Seller.
+                let issuer_entity_id = self
+                    .corporations
+                    .get(corp_id)
+                    .map(|c| c.entity_id);
+
                 let seller_pos = self
                     .equity_positions
                     .entry((corp_id, fill.seller_entity_id))
@@ -730,11 +850,21 @@ impl WorldState {
                 seller_pos.reserved_shares -= fill.qty;
                 seller_pos.owned_shares -= fill.qty;
 
-                let buyer_pos = self
-                    .equity_positions
-                    .entry((corp_id, fill.buyer_entity_id))
-                    .or_default();
-                buyer_pos.owned_shares = buyer_pos.owned_shares.saturating_add(fill.qty);
+                if issuer_entity_id == Some(fill.buyer_entity_id) {
+                    // Corporate Share Buyback: the issuing corporation purchased its own shares and immediately retires them!
+                    if let Some(corp) = self.corporations.get_mut(corp_id) {
+                        corp.total_shares_outstanding = corp
+                            .total_shares_outstanding
+                            .saturating_sub(fill.qty)
+                            .max(1);
+                    }
+                } else {
+                    let buyer_pos = self
+                        .equity_positions
+                        .entry((corp_id, fill.buyer_entity_id))
+                        .or_default();
+                    buyer_pos.owned_shares = buyer_pos.owned_shares.saturating_add(fill.qty);
+                }
 
                 let buyer_eq = self
                     .ledger
@@ -1026,8 +1156,25 @@ impl WorldState {
             match role {
                 CorporationRole::ResourceExtractor { output_sku } => {
                     // Extractor capitalizes daily extraction labor directly into InventoryRaw
+                    // while respecting a 6-day raw-material stockpile cap and 5-day survival floor
+                    let current_stock = self
+                        .corporations
+                        .get(corp_id)
+                        .map_or(0, |c| c.inventory_lot(output_sku).total_qty());
+                    let max_stock = daily_capacity.saturating_mul(6);
+                    let survival_floor = self.corporations.get(corp_id).map_or(Money::ZERO, |c| {
+                        c.daily_wage_bill
+                            .checked_add(c.daily_manager_bill)
+                            .unwrap_or(Money::ZERO)
+                            .checked_mul_u64(5)
+                            .unwrap_or(Money::ZERO)
+                    });
                     let avail_cash = self.ledger.available_cash(entity_id)?;
-                    if daily_capacity > 0 && avail_cash >= daily_wage_bill && daily_wage_bill.is_positive() {
+                    if daily_capacity > 0
+                        && current_stock < max_stock
+                        && avail_cash >= daily_wage_bill.checked_add(survival_floor)?
+                        && daily_wage_bill.is_positive()
+                    {
                         let inv_code = self
                             .skus
                             .get(output_sku)
@@ -1264,10 +1411,233 @@ impl WorldState {
             }
         }
 
+        // 3. Closed-loop Secondary Equity CLOB Market-Making & Portfolio Rebalancing
+        self.run_subphase_3_equity_market_making()?;
+
         // Finalize daily OHLCV bar across all Commodity & Equity order books
         let tick = self.current_tick.0;
         for (_, book) in &mut self.order_books {
             book.finalize_daily_bar(tick);
+        }
+
+        Ok(())
+    }
+
+    /// Computes a corporation's fundamental per-share valuation from its trailing earnings yield,
+    /// dividend yield, and GAAP book value per share.
+    pub fn compute_fundamental_share_valuation(&self, corp_id: CorpId) -> Result<Money, CoreError> {
+        let corp = self
+            .corporations
+            .get(corp_id)
+            .ok_or(CoreError::UnknownCorporation(corp_id))?;
+        let shares = i128::from(corp.total_shares_outstanding.max(1));
+        let report = FinancialStatementReport::generate(
+            &self.ledger,
+            corp.entity_id,
+            self.current_tick.0,
+        )?;
+
+        let book_value_cents = (report.total_equity_including_net_income.cents() / shares).max(100);
+        // Include physical productive capacity replacement value ($2,500 per daily capacity unit) in intrinsic asset backing
+        let capacity_value_cents =
+            (i128::from(corp.daily_capacity) * 250_000) / shares;
+        let intrinsic_asset_cents = book_value_cents.max(capacity_value_cents);
+
+        let quarter_days = i128::from(((self.current_tick.0.saturating_sub(1)) % 90) + 1);
+        let annualized_ni_cents = (report.net_income.cents().max(0) * 360) / quarter_days;
+        // 12x P/E multiple on annualized net income per share
+        let earnings_value_cents = (annualized_ni_cents * 12) / shares;
+
+        let annualized_div_cents = corp.last_monthly_dividend_paid.cents().max(0) * 12;
+        // 5% target dividend yield -> 20x annualized dividend per share
+        let div_value_cents = (annualized_div_cents * 20) / shares;
+
+        let blended_cents =
+            (intrinsic_asset_cents * 40 + earnings_value_cents * 40 + div_value_cents * 20) / 100;
+        Ok(Money::from_cents(blended_cents.clamp(800, 100_000)))
+    }
+
+    fn run_subphase_3_equity_market_making(&mut self) -> Result<(), CoreError> {
+        let Some((wage_entity, mgr_entity, cap_entity)) = self.all_cohort_entities() else {
+            return Ok(());
+        };
+        let (wage_floor, mgr_floor, cap_floor) = {
+            let mut wf = Money::ZERO;
+            let mut mf = Money::ZERO;
+            let mut cf = Money::ZERO;
+            for (_, c) in &self.cohorts {
+                match c.kind {
+                    HouseholdCohortKind::WageEarners => wf = c.savings_subsistence_floor,
+                    HouseholdCohortKind::ManagersSkilled => mf = c.savings_subsistence_floor,
+                    HouseholdCohortKind::CapitalistsExecutives => cf = c.savings_subsistence_floor,
+                }
+            }
+            (wf, mf, cf)
+        };
+
+        let equity_books: Vec<(InstrumentId, CorpId)> = self
+            .order_books
+            .iter()
+            .filter_map(|(inst_id, book)| match book.kind {
+                InstrumentKind::Equity { corp_id } => Some((inst_id, corp_id)),
+                InstrumentKind::Commodity { .. } => None,
+            })
+            .collect();
+
+        let num_books = i128::try_from(equity_books.len().max(1)).unwrap_or(6);
+        let tick = self.current_tick.0;
+
+        for (book_idx, (inst_id, corp_id)) in equity_books.into_iter().enumerate() {
+            // Cancel prior household quotes on this equity book to release cash/share reservations cleanly
+            for holder_ent in [cap_entity, mgr_entity, wage_entity] {
+                self.cancel_all_orders_for_entity_on_book(inst_id, holder_ent)?;
+            }
+
+            let fair_val = self.compute_fundamental_share_valuation(corp_id)?;
+            let last_px = self
+                .order_books
+                .get(inst_id)
+                .map_or(fair_val, |b| b.last_price);
+            // Smooth anchor price: 50% fundamental value + 50% trailing market price
+            let anchor_cents = i128::midpoint(fair_val.cents(), last_px.cents()).max(200);
+
+            let bid_l1 = Money::from_cents(((anchor_cents * 98) / 100).max(100));
+            let bid_l2 = Money::from_cents(((anchor_cents * 95) / 100).max(100));
+            let ask_l1 = Money::from_cents(((anchor_cents * 102) / 100).max(bid_l1.cents() + 10));
+            let ask_l2 = Money::from_cents(((anchor_cents * 105) / 100).max(ask_l1.cents() + 10));
+
+            // 1. Capitalists & Executives Cohort posts two-sided market-making depth (Bids + Asks)
+            let cap_avail_shares = self
+                .equity_positions
+                .get(&(corp_id, cap_entity))
+                .map_or(0, |p| p.available_shares());
+            if cap_avail_shares >= 40 {
+                let ask_qty_1 = (cap_avail_shares / 250).clamp(10, 150);
+                let ask_qty_2 = (cap_avail_shares / 200).clamp(10, 200);
+                if ask_qty_1 + ask_qty_2 <= cap_avail_shares {
+                    self.submit_clob_limit_order(
+                        cap_entity,
+                        inst_id,
+                        OrderSide::Ask,
+                        ask_l1,
+                        ask_qty_1,
+                    )?;
+                    self.submit_clob_limit_order(
+                        cap_entity,
+                        inst_id,
+                        OrderSide::Ask,
+                        ask_l2,
+                        ask_qty_2,
+                    )?;
+                }
+            }
+
+            let cap_avail_cash = self.ledger.available_cash(cap_entity)?;
+            let cap_reserve = cap_floor.checked_mul_u64(2)?;
+            if cap_avail_cash > cap_reserve {
+                let per_book_budget = Money::from_cents(
+                    cap_avail_cash.checked_sub(cap_reserve)?.cents() / (num_books * 8),
+                );
+                let b1_budget = Money::from_cents(per_book_budget.cents() / 2);
+                let b2_budget = Money::from_cents(per_book_budget.cents() / 2);
+
+                let b1_qty = u64::try_from(
+                    b1_budget.checked_div_euclid(bid_l1.cents())?.cents(),
+                )
+                .unwrap_or(0)
+                .min(150);
+                if b1_qty >= 5 {
+                    self.submit_clob_limit_order(
+                        cap_entity,
+                        inst_id,
+                        OrderSide::Bid,
+                        bid_l1,
+                        b1_qty,
+                    )?;
+                }
+
+                let b2_qty = u64::try_from(
+                    b2_budget.checked_div_euclid(bid_l2.cents())?.cents(),
+                )
+                .unwrap_or(0)
+                .min(200);
+                if b2_qty >= 5 {
+                    self.submit_clob_limit_order(
+                        cap_entity,
+                        inst_id,
+                        OrderSide::Bid,
+                        bid_l2,
+                        b2_qty,
+                    )?;
+                }
+            }
+
+            // 2. Managers & Skilled Cohort rebalances equity portfolio against Capitalist quotes
+            let idx_u64 = u64::try_from(book_idx).unwrap_or(0);
+            let cycle = (tick.wrapping_add(idx_u64 * 5)) % 6;
+            if fair_val >= last_px || cycle < 3 {
+                // Managers accumulate undervalued / high-yield shares by lifting Asks or posting Bids
+                let mgr_cash = self.ledger.available_cash(mgr_entity)?;
+                let mgr_reserve = mgr_floor.checked_mul_u64(2)?;
+                if mgr_cash > mgr_reserve {
+                    let alloc = Money::from_cents(
+                        mgr_cash.checked_sub(mgr_reserve)?.cents() / (num_books * 16),
+                    );
+                    let buy_px = if cycle == 0 { ask_l1 } else { bid_l1 };
+                    let qty = u64::try_from(alloc.checked_div_euclid(buy_px.cents())?.cents())
+                        .unwrap_or(0)
+                        .min(60);
+                    if qty >= 2 {
+                        self.submit_clob_limit_order(
+                            mgr_entity,
+                            inst_id,
+                            OrderSide::Bid,
+                            buy_px,
+                            qty,
+                        )?;
+                    }
+                }
+            } else {
+                // Managers trim appreciated positions by hitting Bids or posting Asks
+                let mgr_shares = self
+                    .equity_positions
+                    .get(&(corp_id, mgr_entity))
+                    .map_or(0, |p| p.available_shares());
+                if mgr_shares >= 100 {
+                    let sell_qty = (mgr_shares / 300).clamp(2, 40);
+                    let sell_px = if cycle == 3 { bid_l1 } else { ask_l1 };
+                    self.submit_clob_limit_order(
+                        mgr_entity,
+                        inst_id,
+                        OrderSide::Ask,
+                        sell_px,
+                        sell_qty,
+                    )?;
+                }
+            }
+
+            // 3. Wage Earners Cohort invests excess savings or takes profits periodically
+            if (tick.wrapping_add(idx_u64)) % 5 == 0 {
+                let wage_cash = self.ledger.available_cash(wage_entity)?;
+                let wage_reserve = wage_floor.checked_mul_u64(3)?;
+                if wage_cash > wage_reserve {
+                    let alloc = Money::from_cents(
+                        wage_cash.checked_sub(wage_reserve)?.cents() / (num_books * 30),
+                    );
+                    let qty = u64::try_from(alloc.checked_div_euclid(ask_l1.cents())?.cents())
+                        .unwrap_or(0)
+                        .min(25);
+                    if qty >= 1 {
+                        self.submit_clob_limit_order(
+                            wage_entity,
+                            inst_id,
+                            OrderSide::Bid,
+                            ask_l1,
+                            qty,
+                        )?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1446,16 +1816,29 @@ impl WorldState {
             }
         }
 
-        // 5B. Daily 30/360 Loan Interest & Deposit Interest Accruals (preserving 5-day survival working-capital floor)
+                // 5B. Daily 30/360 Loan Interest & Deposit Interest Accruals (preserving 5-day survival working-capital floor)
         for &corp_id in &corp_ids {
-            let Some(c) = self.corporations.get(corp_id) else {
+            let Some((entity_id, survival_floor)) = self.corporations.get(corp_id).and_then(|c| {
+                let floor = c
+                    .daily_wage_bill
+                    .checked_add(c.daily_manager_bill)
+                    .ok()?
+                    .checked_mul_u64(5)
+                    .ok()?;
+                Some((c.entity_id, floor))
+            }) else {
                 continue;
             };
-            let entity_id = c.entity_id;
-            let survival_floor = c
-                .daily_wage_bill
-                .checked_add(c.daily_manager_bill)?
-                .checked_mul_u64(5)?;
+            if let Some(eq_id) = self
+                .corporations
+                .get(corp_id)
+                .and_then(|c| c.equity_instrument_id)
+            {
+                let avail = self.ledger.available_cash(entity_id)?;
+                if avail < survival_floor {
+                    self.cancel_all_orders_for_entity_on_book(eq_id, entity_id)?;
+                }
+            }
             self.bank
                 .accrue_and_collect_daily_loan_interest_with_floor(
                     &mut self.ledger,
@@ -1656,6 +2039,9 @@ impl WorldState {
 
         let desired_div = regular_div.max(excess_hoard_sweep);
         let total_dividend = desired_div.min(fresh_distributable);
+        if let Some(c) = self.corporations.get_mut(corp_id) {
+            c.last_monthly_dividend_paid = total_dividend;
+        }
         if !total_dividend.is_positive() {
             return Ok(());
         }
@@ -1663,10 +2049,9 @@ impl WorldState {
         // Collect all shareholders of `corp_id` (note: reserved_shares still belong to `owned_shares` until fill!)
         let shareholder_weights: Vec<(EntityId, u64)> = self
             .equity_positions
-            .range((corp_id, EntityId::default())..)
-            .take_while(|&(&(cid, _), _)| cid == corp_id)
-            .filter_map(|(&(_, holder_id), pos)| {
-                if pos.owned_shares > 0 && holder_id != entity_id {
+            .iter()
+            .filter_map(|(&(cid, holder_id), pos)| {
+                if cid == corp_id && pos.owned_shares > 0 && holder_id != entity_id {
                     Some((holder_id, pos.owned_shares))
                 } else {
                     None
@@ -1725,14 +2110,16 @@ impl WorldState {
         Some((wage?, mgr?, cap?))
     }
 
-    /// Audits both:
+    /// Audits:
     /// 1. `self.ledger.audit_trial_balance()` (global double-entry conservation + endogenous M1 conservation).
     /// 2. Every corporation's `WacInventoryLot` book values summed by account code match the corporation's
     ///    ledger `InventoryRaw` / `InventoryWip` / `InventoryFinished` balance to the exact cent.
+    /// 3. `CapTable` share conservation: for every corporation, the sum of `owned_shares` across all
+    ///    holders in `equity_positions` equals `corp.total_shares_outstanding` and `reserved_shares <= owned_shares`.
     pub fn audit_world_invariants(&self) -> Result<(), CoreError> {
         self.ledger.audit_trial_balance()?;
 
-        for (_, corp) in &self.corporations {
+        for (corp_id, corp) in &self.corporations {
             let mut expected_by_code: BTreeMap<StandardAccountCode, Money> = BTreeMap::new();
             for (&sku_id, lot) in &corp.inventory {
                 let sku = self.skus.get(sku_id).ok_or(CoreError::UnknownSku(sku_id))?;
@@ -1757,6 +2144,31 @@ impl WorldState {
                         ),
                     }));
                 }
+            }
+
+            let mut total_cap_table_shares = 0u64;
+            for (&(cid, _), pos) in &self.equity_positions {
+                if cid != corp_id {
+                    continue;
+                }
+                if pos.reserved_shares > pos.owned_shares {
+                    return Err(CoreError::Ledger(LedgerError::TrialBalanceViolation {
+                        reason: format!(
+                            "corporation {} CapTable violation: reserved_shares ({}) > owned_shares ({})",
+                            corp.ticker, pos.reserved_shares, pos.owned_shares
+                        ),
+                    }));
+                }
+                total_cap_table_shares = total_cap_table_shares.saturating_add(pos.owned_shares);
+            }
+
+            if total_cap_table_shares != corp.total_shares_outstanding {
+                return Err(CoreError::Ledger(LedgerError::TrialBalanceViolation {
+                    reason: format!(
+                        "corporation {} ({}) CapTable share conservation mismatch: sum(owned_shares) ({total_cap_table_shares}) != total_shares_outstanding ({})",
+                        corp.ticker, corp.name, corp.total_shares_outstanding
+                    ),
+                }));
             }
         }
 
@@ -1813,6 +2225,7 @@ impl WorldState {
                 ticker: corp.ticker.clone(),
                 name: corp.name.clone(),
                 role: corp.role,
+                persona_kind: corp.persona_kind,
                 delegation: corp.delegation,
                 cash_balance,
                 available_cash,
@@ -1828,6 +2241,7 @@ impl WorldState {
                 total_shares_outstanding: corp.total_shares_outstanding,
                 share_price,
                 market_cap,
+                last_monthly_dividend_paid: corp.last_monthly_dividend_paid,
                 inventory: corp.inventory.clone(),
                 financial_statement,
             });

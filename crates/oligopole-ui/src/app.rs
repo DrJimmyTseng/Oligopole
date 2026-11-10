@@ -7,7 +7,8 @@ use crate::theme::{
 use egui::{Context, RichText, TopBottomPanel, Ui, WidgetText};
 use egui_tiles::{SimplificationOptions, TileId, Tiles, Tree, UiResponse};
 use oligopole_ai::{
-    ActorObservationView, DecisionPolicy, PersonaBiasVector, System0HeuristicPolicy,
+    ActorObservationView, AdaptiveDecisionPolicy, AiBackendStatus, DecisionPolicy,
+    PersonaBiasVector,
 };
 use oligopole_core::{PlayerCommand, WorldState, WorldView};
 use std::sync::{
@@ -62,6 +63,8 @@ pub struct OligopoleTerminalApp {
     command_status: String,
     view_rx: watch::Receiver<Arc<WorldView>>,
     latest_view: Arc<WorldView>,
+    ai_status_rx: watch::Receiver<AiBackendStatus>,
+    latest_ai_status: AiBackendStatus,
     cmd_tx: mpsc::UnboundedSender<PlayerCommand>,
     speed_mode: Arc<AtomicU32>,
     theme_initialized: bool,
@@ -80,8 +83,10 @@ impl OligopoleTerminalApp {
         view_rx: watch::Receiver<Arc<WorldView>>,
         cmd_tx: mpsc::UnboundedSender<PlayerCommand>,
         speed_mode: Arc<AtomicU32>,
+        ai_status_rx: watch::Receiver<AiBackendStatus>,
     ) -> Self {
         let latest_view = view_rx.borrow().clone();
+        let latest_ai_status = ai_status_rx.borrow().clone();
         let tree = Self::create_default_bloomberg_tree();
         Self {
             tree,
@@ -90,6 +95,8 @@ impl OligopoleTerminalApp {
             command_status: String::from("READY • Type `<TICKER> <MM|GP|OB|FA|OPS|EX>` or click Market Monitor"),
             view_rx,
             latest_view,
+            ai_status_rx,
+            latest_ai_status,
             cmd_tx,
             speed_mode,
             theme_initialized: false,
@@ -161,6 +168,9 @@ impl eframe::App for OligopoleTerminalApp {
         if self.view_rx.has_changed().unwrap_or(false) {
             self.latest_view = self.view_rx.borrow_and_update().clone();
         }
+        if self.ai_status_rx.has_changed().unwrap_or(false) {
+            self.latest_ai_status = self.ai_status_rx.borrow_and_update().clone();
+        }
 
         // Top Bloomberg Command Bar & Macro Telemetry Ribbon
         TopBottomPanel::top("bloomberg_top_command_bar").show(ctx, |ui| {
@@ -214,6 +224,17 @@ impl eframe::App for OligopoleTerminalApp {
                     ))
                     .color(EMERALD_ACCENT),
                 );
+                ui.separator();
+                let ai_color = if self.latest_ai_status.is_clef_flash() {
+                    EMERALD_ACCENT
+                } else {
+                    AMBER_PRIMARY
+                };
+                ui.label(
+                    RichText::new(format!("[{}]", self.latest_ai_status.badge_label()))
+                        .color(ai_color)
+                        .strong(),
+                );
             });
             ui.label(RichText::new(&self.command_status).small());
         });
@@ -236,6 +257,7 @@ pub type SimulationThreadHandles = (
     watch::Receiver<Arc<WorldView>>,
     mpsc::UnboundedSender<PlayerCommand>,
     Arc<AtomicU32>,
+    watch::Receiver<AiBackendStatus>,
 );
 
 /// Spawns the dedicated simulation thread communicating with `OligopoleTerminalApp` via a
@@ -243,16 +265,17 @@ pub type SimulationThreadHandles = (
 /// and an MPSC `PlayerCommand` channel.
 pub fn spawn_simulation_thread(
     mut world: WorldState,
+    clef_addr: Option<&str>,
 ) -> Result<SimulationThreadHandles, oligopole_core::CoreError> {
     let initial_view = Arc::new(world.build_world_view()?);
     let (view_tx, view_rx) = watch::channel(initial_view);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PlayerCommand>();
     let speed_mode = Arc::new(AtomicU32::new(SPEED_NORMAL));
     let speed_clone = Arc::clone(&speed_mode);
+    let mut policy = AdaptiveDecisionPolicy::connect_or_fallback(clef_addr);
+    let (ai_status_tx, ai_status_rx) = watch::channel(policy.status().clone());
 
     thread::spawn(move || {
-        let mut policy = System0HeuristicPolicy::new();
-        let persona = PersonaBiasVector::balanced_executive();
         let frame_budget = Duration::from_micros(8_333); // 120 Hz snapshot cap
         let mut last_publish = Instant::now();
         let mut pending = Vec::new();
@@ -272,6 +295,17 @@ pub fn spawn_simulation_thread(
             if next_tick_num.is_multiple_of(30) {
                 let corp_ids: Vec<_> = world.corporations.keys().collect();
                 for cid in corp_ids {
+                    let Some((persona_kind, accepts_ai)) = world
+                        .corporations
+                        .get(cid)
+                        .map(|c| (c.persona_kind, c.delegation.accepts_slow_tick_ai()))
+                    else {
+                        continue;
+                    };
+                    if !accepts_ai {
+                        continue;
+                    }
+                    let persona = PersonaBiasVector::from_archetype(persona_kind);
                     if let Ok(obs) = ActorObservationView::build(&world, cid) {
                         if let Ok((directive, _)) =
                             policy.evaluate_actor_slow_tick(world.world_seed, &obs, &persona)
@@ -280,6 +314,7 @@ pub fn spawn_simulation_thread(
                         }
                     }
                 }
+                let _ = ai_status_tx.send(policy.status().clone());
             }
 
             if world.step_fast_tick(&pending).is_err() {
@@ -304,13 +339,16 @@ pub fn spawn_simulation_thread(
         }
     });
 
-    Ok((view_rx, cmd_tx, speed_mode))
+    Ok((view_rx, cmd_tx, speed_mode, ai_status_rx))
 }
 
 /// Launches the native 120 FPS `eframe` / `egui_tiles` Bloomberg Terminal window for `world`.
-pub fn launch_native_terminal(world: WorldState) -> Result<(), String> {
-    let (view_rx, cmd_tx, speed_mode) =
-        spawn_simulation_thread(world).map_err(|e| e.to_string())?;
+pub fn launch_native_terminal(
+    world: WorldState,
+    clef_addr: Option<&str>,
+) -> Result<(), String> {
+    let (view_rx, cmd_tx, speed_mode, ai_status_rx) =
+        spawn_simulation_thread(world, clef_addr).map_err(|e| e.to_string())?;
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -324,7 +362,10 @@ pub fn launch_native_terminal(world: WorldState) -> Result<(), String> {
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(OligopoleTerminalApp::new(
-                view_rx, cmd_tx, speed_mode,
+                view_rx,
+                cmd_tx,
+                speed_mode,
+                ai_status_rx,
             )))
         }),
     )

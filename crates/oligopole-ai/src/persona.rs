@@ -1,5 +1,5 @@
 use crate::error::AiError;
-use oligopole_core::{decimal_bytes_serde, pade_exp_neg};
+use oligopole_core::{ExecutivePersonaKind, decimal_bytes_serde, pade_exp_neg};
 use oligopole_ledger::{Money, allocate_hamilton};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -28,6 +28,19 @@ impl Default for PersonaBiasVector {
 }
 
 impl PersonaBiasVector {
+    pub const fn from_archetype(kind: ExecutivePersonaKind) -> Self {
+        match kind {
+            ExecutivePersonaKind::BalancedExecutive => Self::balanced_executive(),
+            ExecutivePersonaKind::DividendAristocrat => Self::conservative_dividend_steward(),
+            ExecutivePersonaKind::AggressiveEmpireBuilder => Self::aggressive_growth_ceo(),
+            ExecutivePersonaKind::QualityMoatCompounder => Self::quality_moat_compounder(),
+            ExecutivePersonaKind::CostUndercutChallenger => Self::cost_undercut_challenger(),
+            ExecutivePersonaKind::OpportunisticCapitalAllocator => {
+                Self::opportunistic_capital_allocator()
+            }
+        }
+    }
+
     pub const fn balanced_executive() -> Self {
         Self {
             risk_appetite: dec!(0.1),
@@ -52,6 +65,33 @@ impl PersonaBiasVector {
             leverage_tolerance: dec!(-0.7),
             price_aggression: dec!(-0.3),
             shareholder_yield_bias: dec!(0.8),
+        }
+    }
+
+    pub const fn quality_moat_compounder() -> Self {
+        Self {
+            risk_appetite: dec!(0.3),
+            leverage_tolerance: dec!(-0.2),
+            price_aggression: dec!(-0.6),
+            shareholder_yield_bias: dec!(0.3),
+        }
+    }
+
+    pub const fn cost_undercut_challenger() -> Self {
+        Self {
+            risk_appetite: dec!(0.4),
+            leverage_tolerance: dec!(0.3),
+            price_aggression: dec!(0.8),
+            shareholder_yield_bias: dec!(-0.2),
+        }
+    }
+
+    pub const fn opportunistic_capital_allocator() -> Self {
+        Self {
+            risk_appetite: dec!(-0.2),
+            leverage_tolerance: dec!(-0.5),
+            price_aggression: dec!(0.2),
+            shareholder_yield_bias: dec!(0.6),
         }
     }
 }

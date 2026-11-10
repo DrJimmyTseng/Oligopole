@@ -1,7 +1,8 @@
 //! `oligopole-cli`: Composition root for Oligopole (`sim-bench`, `verify-replay`, `terminal`).
 
 use oligopole_ai::{
-    ActorObservationView, DecisionPolicy, PersonaBiasVector, System0HeuristicPolicy,
+    ActorObservationView, AdaptiveDecisionPolicy, DEFAULT_CLEF_WORKER_ADDR, DecisionPolicy,
+    PersonaBiasVector,
 };
 use oligopole_core::{PlayerCommand, build_vertical_slice_0};
 use oligopole_store::{DecisionOutboxEntry, DecisionSourceKind, OligopoleStore, to_hex};
@@ -29,6 +30,7 @@ fn run_cli() -> Result<(), String> {
             let mut ticks: u64 = 10_000;
             let mut seed_byte: u8 = 42;
             let mut save_path: Option<String> = None;
+            let mut clef_addr: Option<String> = None;
 
             let mut idx = 1usize;
             while idx < args.len() {
@@ -57,13 +59,25 @@ fn run_cli() -> Result<(), String> {
                             return Err("--save requires a file path".to_owned());
                         }
                     }
+                    Some("--clef-flash") => {
+                        let next_is_addr = args
+                            .get(idx + 1)
+                            .is_some_and(|v| !v.starts_with("--"));
+                        if next_is_addr {
+                            clef_addr = args.get(idx + 1).cloned();
+                            idx += 2;
+                        } else {
+                            clef_addr = Some(DEFAULT_CLEF_WORKER_ADDR.to_owned());
+                            idx += 1;
+                        }
+                    }
                     other => {
                         return Err(format!("unknown argument: {other:?}"));
                     }
                 }
             }
 
-            run_sim_bench(ticks, seed_byte, save_path.as_deref())
+            run_sim_bench(ticks, seed_byte, save_path.as_deref(), clef_addr.as_deref())
         }
         "verify-replay" => {
             let mut save_path: Option<String> = None;
@@ -84,14 +98,40 @@ fn run_cli() -> Result<(), String> {
             let path = save_path.ok_or_else(|| "verify-replay requires --save <path>".to_owned())?;
             run_verify_replay(&path)
         }
-        "terminal" => run_terminal(),
+        "terminal" => {
+            let mut clef_addr: Option<String> = None;
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args.get(idx).map(String::as_str) {
+                    Some("--clef-flash") => {
+                        let next_is_addr = args
+                            .get(idx + 1)
+                            .is_some_and(|v| !v.starts_with("--"));
+                        if next_is_addr {
+                            clef_addr = args.get(idx + 1).cloned();
+                            idx += 2;
+                        } else {
+                            clef_addr = Some(DEFAULT_CLEF_WORKER_ADDR.to_owned());
+                            idx += 1;
+                        }
+                    }
+                    other => return Err(format!("unknown argument: {other:?}")),
+                }
+            }
+            run_terminal(clef_addr.as_deref())
+        }
         other => Err(format!(
             "unknown subcommand '{other}'. Expected 'sim-bench', 'verify-replay', or 'terminal'."
         )),
     }
 }
 
-fn run_sim_bench(ticks: u64, seed_byte: u8, save_path: Option<&str>) -> Result<(), String> {
+fn run_sim_bench(
+    ticks: u64,
+    seed_byte: u8,
+    save_path: Option<&str>,
+    clef_addr: Option<&str>,
+) -> Result<(), String> {
     let seed = [seed_byte; 32];
     let (mut world, _) = build_vertical_slice_0(seed).map_err(|e| e.to_string())?;
     let mut store = match save_path {
@@ -99,8 +139,7 @@ fn run_sim_bench(ticks: u64, seed_byte: u8, save_path: Option<&str>) -> Result<(
         None => OligopoleStore::open_in_memory().map_err(|e| e.to_string())?,
     };
 
-    let mut policy = System0HeuristicPolicy::new();
-    let persona = PersonaBiasVector::balanced_executive();
+    let mut policy = AdaptiveDecisionPolicy::connect_or_fallback(clef_addr);
 
     // Save Genesis checkpoint (Tick 0)
     let genesis_hash = store.save_checkpoint(&world, &[]).map_err(|e| e.to_string())?;
@@ -114,16 +153,32 @@ fn run_sim_bench(ticks: u64, seed_byte: u8, save_path: Option<&str>) -> Result<(
         if day.is_multiple_of(30) {
             let corp_ids: Vec<_> = world.corporations.keys().collect();
             for (seq, cid) in corp_ids.into_iter().enumerate() {
+                let Some((persona_kind, accepts_ai)) = world
+                    .corporations
+                    .get(cid)
+                    .map(|c| (c.persona_kind, c.delegation.accepts_slow_tick_ai()))
+                else {
+                    continue;
+                };
+                if !accepts_ai {
+                    continue;
+                }
+                let persona = PersonaBiasVector::from_archetype(persona_kind);
                 let obs = ActorObservationView::build(&world, cid).map_err(|e| e.to_string())?;
                 let (directive, probs_hash) = policy
                     .evaluate_actor_slow_tick(seed, &obs, &persona)
                     .map_err(|e| e.to_string())?;
+                let source_kind = if policy.status().is_clef_flash() {
+                    DecisionSourceKind::ClefFlashSlowTick
+                } else {
+                    DecisionSourceKind::System0Heuristic
+                };
                 let cmd = PlayerCommand::ApplyStrategicDirective(directive);
                 day_cmds.push(cmd.clone());
                 pending_outbox.push(DecisionOutboxEntry {
                     tick: day,
                     seq_no: u32::try_from(seq).unwrap_or(0),
-                    source_kind: DecisionSourceKind::System0Heuristic,
+                    source_kind,
                     command: cmd,
                     probs_blake3_hash: probs_hash,
                 });
@@ -158,6 +213,7 @@ fn run_sim_bench(ticks: u64, seed_byte: u8, save_path: Option<&str>) -> Result<(
     println!(
         " Wall Time       : {elapsed:.2?} ({tps:.0} Fast Ticks / sec)"
     );
+    println!(" AI Backend      : {}", policy.status().badge_label());
     println!(" Genesis Blake3  : {}", to_hex(&genesis_hash));
     println!(" Final Blake3    : {}", to_hex(&final_hash));
     println!(
@@ -165,12 +221,17 @@ fn run_sim_bench(ticks: u64, seed_byte: u8, save_path: Option<&str>) -> Result<(
         view.total_m1_money_supply, view.total_bank_loans
     );
     println!("--------------------------------------------------------------------------------");
-    println!(" TICKER | CORPORATION NAME                  | CASH         | LOANS        | SELL PX");
+    println!(" TICKER | CORPORATION NAME                  | CASH         | LOANS        | SELL PX | EQ PX");
     println!("--------------------------------------------------------------------------------");
     for corp in &view.corporations {
         println!(
-            " {:<6} | {:<33} | {:>12} | {:>12} | {:>7}",
-            corp.ticker, corp.name, corp.cash_balance, corp.loans_payable, corp.posted_selling_price
+            " {:<6} | {:<33} | {:>12} | {:>12} | {:>7} | {:>7}",
+            corp.ticker,
+            corp.name,
+            corp.cash_balance,
+            corp.loans_payable,
+            corp.posted_selling_price,
+            corp.share_price
         );
     }
     println!("================================================================================");
@@ -201,7 +262,7 @@ fn run_verify_replay(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_terminal() -> Result<(), String> {
+fn run_terminal(clef_addr: Option<&str>) -> Result<(), String> {
     let (world, _) = build_vertical_slice_0([42u8; 32]).map_err(|e| e.to_string())?;
-    launch_native_terminal(world)
+    launch_native_terminal(world, clef_addr)
 }

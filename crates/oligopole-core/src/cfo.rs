@@ -98,6 +98,33 @@ pub fn reconcile_strategic_directive(
             }
         }
         JointCapitalAction::SignB2BContract { .. } => {}
+        JointCapitalAction::RepurchaseShares {
+            buyback_budget,
+            max_limit_price,
+        } => {
+            let safe_budget = (*buyback_budget).min(free_cash_above_floor);
+            if safe_budget.is_positive() && max_limit_price.is_positive() {
+                cash_after_capex = free_cash_above_floor.checked_sub(safe_budget)?;
+                directive.capital_action = JointCapitalAction::RepurchaseShares {
+                    buyback_budget: safe_budget,
+                    max_limit_price: *max_limit_price,
+                };
+            } else {
+                directive.capital_action = JointCapitalAction::HoldAndDelever {
+                    repay_amount: Money::ZERO,
+                };
+            }
+        }
+        JointCapitalAction::IssueEquityShares {
+            shares_to_issue,
+            min_ask_price,
+        } => {
+            if *shares_to_issue == 0 || !min_ask_price.is_positive() {
+                directive.capital_action = JointCapitalAction::HoldAndDelever {
+                    repay_amount: Money::ZERO,
+                };
+            }
+        }
     }
 
     if cash_after_capex.is_zero() {

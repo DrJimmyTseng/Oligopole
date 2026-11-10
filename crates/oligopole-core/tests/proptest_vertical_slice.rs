@@ -74,6 +74,23 @@ fn test_vertical_slice_0_runs_360_days_full_year_invariants() {
         .unwrap();
     assert!(!iron_book.recent_fills.is_empty(), "expected commodity CLOB fills");
 
+    // Verify closed-loop secondary Equity CLOB market-making produced active fills and L2 depth
+    for eq_ticker in ["IRON EQ", "VALE EQ", "ACME EQ", "ZENI EQ", "PLYR EQ", "APEX EQ"] {
+        let eq_book = view
+            .instruments
+            .iter()
+            .find(|i| i.ticker == eq_ticker)
+            .unwrap();
+        assert!(
+            !eq_book.recent_fills.is_empty(),
+            "expected secondary equity CLOB fills on {eq_ticker}"
+        );
+        assert!(
+            eq_book.best_bid.is_some() && eq_book.best_ask.is_some(),
+            "expected two-sided resting L2 depth on {eq_ticker}"
+        );
+    }
+
     // Verify all solvent corporations maintained positive working capital above $0.00
     for corp in &view.corporations {
         assert!(
@@ -84,15 +101,68 @@ fn test_vertical_slice_0_runs_360_days_full_year_invariants() {
     }
 }
 
+#[test]
+fn test_player_manual_vs_ai_autopilot_delegation_enforcement() {
+    let (mut world, handles) = build_vertical_slice_0([11u8; 32]).unwrap();
+    let plyr_id = handles.player_retail_corp;
+
+    // Switch PLYR to full Manual Executive Control
+    world
+        .execute_command(PlayerCommand::UpdateAiDelegation {
+            corp_id: plyr_id,
+            delegate_pricing: false,
+            delegate_capex: false,
+            delegate_procurement: false,
+        })
+        .unwrap();
+
+    let manual_price = Money::from_dollars(231);
+    world
+        .execute_command(PlayerCommand::SetCorporationPrice {
+            corp_id: plyr_id,
+            new_price: manual_price,
+        })
+        .unwrap();
+
+    assert!(
+        !world
+            .corporations
+            .get(plyr_id)
+            .unwrap()
+            .delegation
+            .accepts_slow_tick_ai()
+    );
+
+    // Even if a StrategicDirective is sent to PLYR while pricing & capex delegation are false,
+    // `apply_reconciled_directive` must preserve the player's manual selling price and wage bill.
+    let initial_wage = world.corporations.get(plyr_id).unwrap().daily_wage_bill;
+    world
+        .execute_command(PlayerCommand::ApplyStrategicDirective(StrategicDirective {
+            corp_id: plyr_id,
+            capital_action: JointCapitalAction::HoldAndDelever {
+                repay_amount: Money::ZERO,
+            },
+            pricing_stance: PricingStance::AggressiveUndercut,
+            wage_stance: WageStance::Raise5Pct,
+            dividend_stance: DividendStance::High70Pct,
+            confidence_score: 9,
+        }))
+        .unwrap();
+
+    let plyr_after = world.corporations.get(plyr_id).unwrap();
+    assert_eq!(plyr_after.posted_selling_price, manual_price);
+    assert_eq!(plyr_after.daily_wage_bill, initial_wage);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
     #[test]
-    fn prop_vertical_slice_0_conserves_money_and_wac_under_random_directives(
+    fn prop_vertical_slice_0_conserves_money_wac_and_captable_under_buybacks_and_issuance(
         months in 1usize..=6,
         pricing_idx in 0usize..4,
         wage_idx in 0usize..3,
         div_idx in 0usize..4,
-        capex_mode in 0usize..4,
+        capex_mode in 0usize..6,
     ) {
         let (mut world, handles) = build_vertical_slice_0([42u8; 32]).unwrap();
         let pricing = [
@@ -132,11 +202,19 @@ proptest! {
                         loan_principal: Money::from_dollars(80_000),
                         estimated_npv: Money::from_dollars(110_000),
                     },
-                    _ => JointCapitalAction::BrandAndQualityCampaign {
+                    3 => JointCapitalAction::BrandAndQualityCampaign {
                         campaign_cost: Money::from_dollars(25_000),
                         quality_boost_bps: 200,
                         brand_boost_bps: 300,
                         estimated_npv: Money::from_dollars(45_000),
+                    },
+                    4 => JointCapitalAction::RepurchaseShares {
+                        buyback_budget: Money::from_dollars(35_000),
+                        max_limit_price: Money::from_dollars(65),
+                    },
+                    _ => JointCapitalAction::IssueEquityShares {
+                        shares_to_issue: 2_500,
+                        min_ask_price: Money::from_dollars(30),
                     },
                 };
 

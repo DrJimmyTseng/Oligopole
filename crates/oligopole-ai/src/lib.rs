@@ -19,4 +19,6 @@ pub use protocol::{
     ClefQuestionDistribution, ClefQuestionType, ClefTypedQuestion, ClefWorkerRequest,
     ClefWorkerResponse, DEFAULT_CLEF_WORKER_ADDR, HandshakeVerification,
 };
-pub use system0::{DecisionPolicy, System0HeuristicPolicy};
+pub use system0::{
+    AdaptiveDecisionPolicy, AiBackendStatus, DecisionPolicy, System0HeuristicPolicy,
+};

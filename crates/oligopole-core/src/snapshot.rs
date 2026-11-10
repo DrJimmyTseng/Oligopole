@@ -3,7 +3,7 @@ use crate::calendar::{Date360, Tick};
 use crate::clob::{InstrumentKind, OhlcvBar, OrderBookDepthLevel, TradeFill};
 use crate::household::HouseholdCohortKind;
 use crate::ids::{CohortId, CorpId, InstrumentId, SkuId};
-use crate::production::{AiDelegationConfig, CorporationRole};
+use crate::production::{AiDelegationConfig, CorporationRole, ExecutivePersonaKind};
 use oligopole_ledger::{EntityId, FinancialStatementReport, Money, WacInventoryLot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,6 +32,7 @@ pub struct CorporationSnapshot {
     pub ticker: String,
     pub name: String,
     pub role: CorporationRole,
+    pub persona_kind: ExecutivePersonaKind,
     pub delegation: AiDelegationConfig,
     pub cash_balance: Money,
     pub available_cash: Money,
@@ -47,6 +48,7 @@ pub struct CorporationSnapshot {
     pub total_shares_outstanding: u64,
     pub share_price: Money,
     pub market_cap: Money,
+    pub last_monthly_dividend_paid: Money,
     pub inventory: BTreeMap<SkuId, WacInventoryLot>,
     pub financial_statement: FinancialStatementReport,
 }
