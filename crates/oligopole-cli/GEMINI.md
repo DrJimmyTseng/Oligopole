@@ -6,7 +6,7 @@
 ## 2. Subcommands
 - `sim-bench --ticks <N> --seed <S> [--save <PATH>] [--clef-flash [ADDR]]`: Executes $N$ Fast Ticks headlessly (default 10,000 ticks = 27.7 simulated 30/360 years) via `AdaptiveDecisionPolicy` (running out-of-the-box on CPU with `System0HeuristicPolicy` or connecting to `clef-flash-worker` with automatic graceful fallback), auditing double-entry trial balance and `CapTable` share conservation on every tick.
 - `verify-replay --save <PATH>`: Loads a `.oligopole` file, replays from `world_seed` + `decision_outbox_journal`, and verifies bit-for-bit `blake3_state_hash` identity against recorded snapshots.
-- `terminal [--clef-flash [ADDR]]`: Launches the 120 FPS `eframe` / `egui_tiles` Bloomberg Terminal connected to the background simulation thread.
+- `terminal [--save <PATH>] [--clef-flash [ADDR]]`: Launches the 120 FPS `eframe` / `egui_tiles` Bloomberg Terminal connected to the background simulation thread, optionally loading/saving a persistent `.oligopole` container (`Ctrl+S` or `💾 SAVE` in the UI, plus automatic annual checkpoints).
 
 ## 3. Benchmark & Replay Verification Status
 - `cargo run --release -p oligopole-cli -- sim-bench --ticks 10000 --seed 42`:

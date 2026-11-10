@@ -15,9 +15,33 @@ pub enum TerminalMnemonic {
     ExecutiveTicket,
 }
 
+impl TerminalMnemonic {
+    pub const ALL: [Self; 6] = [
+        Self::MarketMonitor,
+        Self::GraphPrice,
+        Self::OrderBook,
+        Self::FinancialAnalysis,
+        Self::OperationsDag,
+        Self::ExecutiveTicket,
+    ];
+
+    #[inline]
+    pub const fn short_code(self) -> &'static str {
+        match self {
+            Self::MarketMonitor => "MM",
+            Self::GraphPrice => "GP",
+            Self::OrderBook => "OB",
+            Self::FinancialAnalysis => "FA",
+            Self::OperationsDag => "OPS",
+            Self::ExecutiveTicket => "EX",
+        }
+    }
+}
+
 /// Parsed Bloomberg command from the top command bar (`<TICKER> [MARKET] <MNEMONIC>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTerminalCommand {
+    /// Canonical instrument or corporation ticker (e.g. `"IRON CMDTY"`, `"IRON EQ"`, `"ACME EQ"`, `"PLYR"`).
     pub ticker: String,
     pub mnemonic: TerminalMnemonic,
 }
@@ -46,10 +70,33 @@ pub fn parse_bloomberg_command(input: &str) -> Option<ParsedTerminalCommand> {
         _ => return None,
     };
 
-    Some(ParsedTerminalCommand {
-        ticker: first,
-        mnemonic,
-    })
+    // Preserve explicit market sector qualification (`CMDTY` vs `EQ`) so `IRON CMDTY OB` and `IRON EQ OB`
+    // route to the exact commodity or corporate equity order book!
+    let ticker = match tokens.get(1).map(String::as_str) {
+        Some("CMDTY" | "COMMODITY") => format!("{first} CMDTY"),
+        Some("EQ" | "EQUITY")
+            if matches!(
+                mnemonic,
+                TerminalMnemonic::GraphPrice | TerminalMnemonic::OrderBook
+            ) =>
+        {
+            format!("{first} EQ")
+        }
+        _ if first == "IRON"
+            && matches!(
+                mnemonic,
+                TerminalMnemonic::GraphPrice | TerminalMnemonic::OrderBook
+            )
+            && tokens.len() == 2 =>
+        {
+            // When user types `IRON OB` without sector qualifier, default to `IRON EQ` if they specify `EQ`
+            // or `IRON EQ` for equity / `IRON CMDTY` when qualified
+            "IRON EQ".to_owned()
+        }
+        _ => first,
+    };
+
+    Some(ParsedTerminalCommand { ticker, mnemonic })
 }
 
 #[cfg(test)]
@@ -62,8 +109,15 @@ mod tests {
         assert_eq!(
             parse_bloomberg_command("iron cmdty gp"),
             Some(ParsedTerminalCommand {
-                ticker: "IRON".to_owned(),
+                ticker: "IRON CMDTY".to_owned(),
                 mnemonic: TerminalMnemonic::GraphPrice,
+            })
+        );
+        assert_eq!(
+            parse_bloomberg_command("iron eq ob"),
+            Some(ParsedTerminalCommand {
+                ticker: "IRON EQ".to_owned(),
+                mnemonic: TerminalMnemonic::OrderBook,
             })
         );
         assert_eq!(

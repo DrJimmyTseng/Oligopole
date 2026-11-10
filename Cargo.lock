@@ -1980,6 +1980,7 @@ dependencies = [
  "oligopole-ai",
  "oligopole-core",
  "oligopole-ledger",
+ "oligopole-store",
  "rust_decimal",
  "tokio",
 ]

@@ -100,6 +100,7 @@ fn run_cli() -> Result<(), String> {
         }
         "terminal" => {
             let mut clef_addr: Option<String> = None;
+            let mut save_path: Option<String> = None;
             let mut idx = 1usize;
             while idx < args.len() {
                 match args.get(idx).map(String::as_str) {
@@ -115,10 +116,18 @@ fn run_cli() -> Result<(), String> {
                             idx += 1;
                         }
                     }
+                    Some("--save") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            save_path = Some(val.clone());
+                            idx += 2;
+                        } else {
+                            return Err("--save requires a file path".to_owned());
+                        }
+                    }
                     other => return Err(format!("unknown argument: {other:?}")),
                 }
             }
-            run_terminal(clef_addr.as_deref())
+            run_terminal(clef_addr.as_deref(), save_path.as_deref())
         }
         other => Err(format!(
             "unknown subcommand '{other}'. Expected 'sim-bench', 'verify-replay', or 'terminal'."
@@ -262,7 +271,7 @@ fn run_verify_replay(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_terminal(clef_addr: Option<&str>) -> Result<(), String> {
+fn run_terminal(clef_addr: Option<&str>, save_path: Option<&str>) -> Result<(), String> {
     let (world, _) = build_vertical_slice_0([42u8; 32]).map_err(|e| e.to_string())?;
-    launch_native_terminal(world, clef_addr)
+    launch_native_terminal(world, clef_addr, save_path)
 }

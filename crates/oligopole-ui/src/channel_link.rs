@@ -62,6 +62,10 @@ impl ChannelLinkRegistry {
             .unwrap_or_else(|| fallback.to_owned())
     }
 
+    pub fn active_ticker_ref(&self, channel: LinkChannel) -> Option<&str> {
+        self.active_tickers.get(&channel).map(String::as_str)
+    }
+
     pub fn set_ticker(&mut self, channel: LinkChannel, ticker: impl Into<String>) {
         if channel != LinkChannel::Unlinked {
             self.active_tickers.insert(channel, ticker.into());

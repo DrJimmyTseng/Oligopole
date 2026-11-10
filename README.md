@@ -110,8 +110,11 @@ cargo run --release -p oligopole-cli -- verify-replay --save sim_run.oligopole
 # Launch out-of-the-box on CPU:
 cargo run --release -p oligopole-cli -- terminal
 
+# Resume or persist a live .oligopole container (press Ctrl+S or click SAVE in the UI):
+cargo run --release -p oligopole-cli -- terminal --save session.oligopole
+
 # Or launch with optional Clef-Flash 9B sidecar connection:
-cargo run --release -p oligopole-cli -- terminal --clef-flash 127.0.0.1:19509
+cargo run --release -p oligopole-cli -- terminal --save session.oligopole --clef-flash 127.0.0.1:19509
 ```
 
 ### 5. Start the Optional Local RTX 5090 `Clef-Flash` 9B Sidecar Worker

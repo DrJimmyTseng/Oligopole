@@ -12,6 +12,7 @@ workspace = true
 oligopole-ledger = { workspace = true }
 oligopole-core = { workspace = true }
 oligopole-ai = { workspace = true }
+oligopole-store = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_tiles = { workspace = true }
