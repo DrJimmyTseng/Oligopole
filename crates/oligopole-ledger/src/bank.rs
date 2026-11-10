@@ -198,7 +198,7 @@ impl CommercialBankFacility {
     }
 
     /// Accrues one 30/360 day of loan interest on `borrower_id` and collects as much as
-    /// the borrower's available unreserved cash can cover.
+    /// the borrower's available unreserved cash above `protected_cash_floor` can cover.
     ///
     /// Returns `(interest_paid, unpaid_shortfall)`.
     pub fn accrue_and_collect_daily_loan_interest(
@@ -206,6 +206,24 @@ impl CommercialBankFacility {
         ledger: &mut LedgerEngine,
         tick: u64,
         borrower_id: EntityId,
+    ) -> Result<(Money, Money), LedgerError> {
+        self.accrue_and_collect_daily_loan_interest_with_floor(
+            ledger,
+            tick,
+            borrower_id,
+            Money::ZERO,
+        )
+    }
+
+    /// Accrues one 30/360 day of loan interest on `borrower_id` while preserving `protected_cash_floor`
+    /// in the borrower's cash account. Any unpaid interest shortfall is capitalized onto `LoansPayable` /
+    /// `LoansReceivable` so solvent operating firms never drop to `$0.00` cash intraday.
+    pub fn accrue_and_collect_daily_loan_interest_with_floor(
+        &mut self,
+        ledger: &mut LedgerEngine,
+        tick: u64,
+        borrower_id: EntityId,
+        protected_cash_floor: Money,
     ) -> Result<(Money, Money), LedgerError> {
         let bank_id = self.bank_id()?;
         let Some(loan) = self.loans.get_mut(&borrower_id) else {
@@ -223,7 +241,12 @@ impl CommercialBankFacility {
         }
 
         let avail = ledger.available_cash(borrower_id)?;
-        let paid = due.min(avail);
+        let spendable = if avail > protected_cash_floor {
+            avail.checked_sub(protected_cash_floor)?
+        } else {
+            Money::ZERO
+        };
+        let paid = due.min(spendable);
         let shortfall = due.checked_sub(paid)?;
 
         if paid.is_positive() {

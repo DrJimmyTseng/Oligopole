@@ -209,8 +209,13 @@ impl WorldState {
                 .loans
                 .get(&corp.entity_id)
                 .map_or(Money::ZERO, |l| l.principal_outstanding);
-            let reconciled =
-                reconcile_strategic_directive(corp, avail_cash, debt, raw_directive)?;
+            let reconciled = reconcile_strategic_directive(
+                corp,
+                avail_cash,
+                debt,
+                self.bank.default_loan_rate_bps,
+                raw_directive,
+            )?;
             (corp.entity_id, avail_cash, debt, reconciled)
         };
         let _ = (avail_cash, debt);
@@ -917,14 +922,28 @@ impl WorldState {
                 .ok_or(CoreError::UnknownCorporation(supplier_id))?;
             (sup.entity_id, sup.inventory_lot(sku_id).available_qty())
         };
-        let buyer_entity = self
-            .corporations
-            .get(buyer_id)
-            .ok_or(CoreError::UnknownCorporation(buyer_id))?
-            .entity_id;
+        let (buyer_entity, working_floor) = {
+            let buyer = self
+                .corporations
+                .get(buyer_id)
+                .ok_or(CoreError::UnknownCorporation(buyer_id))?;
+            let debt = self
+                .bank
+                .loans
+                .get(&buyer.entity_id)
+                .map_or(Money::ZERO, |l| l.principal_outstanding);
+            let floor =
+                buyer.working_capital_floor(20, debt, self.bank.default_loan_rate_bps)?;
+            (buyer.entity_id, floor)
+        };
 
         let buyer_cash = self.ledger.available_cash(buyer_entity)?;
-        let affordable_i128 = buyer_cash.checked_div_euclid(unit_price.cents())?.cents();
+        let spendable_cash = if buyer_cash > working_floor {
+            buyer_cash.checked_sub(working_floor)?
+        } else {
+            Money::ZERO
+        };
+        let affordable_i128 = spendable_cash.checked_div_euclid(unit_price.cents())?.cents();
         let affordable_qty = u64::try_from(affordable_i128).unwrap_or(0);
 
         let actual_qty = requested_qty.min(sup_avail).min(affordable_qty);
@@ -1207,8 +1226,25 @@ impl WorldState {
                         if current_qty < target_qty {
                             let needed = target_qty - current_qty;
                             let avail_cash = self.ledger.available_cash(entity_id)?;
-                            // Keep 50% of cash for payroll/working capital when bidding
-                            let bid_budget = Money::from_cents(avail_cash.cents() / 2);
+                            let debt = self
+                                .bank
+                                .loans
+                                .get(&entity_id)
+                                .map_or(Money::ZERO, |l| l.principal_outstanding);
+                            let working_floor = match self.corporations.get(corp_id) {
+                                Some(c) => c.working_capital_floor(
+                                    20,
+                                    debt,
+                                    self.bank.default_loan_rate_bps,
+                                )?,
+                                None => Money::ZERO,
+                            };
+                            let free_cash = if avail_cash > working_floor {
+                                avail_cash.checked_sub(working_floor)?
+                            } else {
+                                Money::ZERO
+                            };
+                            let bid_budget = Money::from_cents(free_cash.cents() / 2);
                             let affordable_i128 =
                                 bid_budget.checked_div_euclid(bid_price.cents())?.cents();
                             let affordable = u64::try_from(affordable_i128).unwrap_or(0);
@@ -1352,40 +1388,81 @@ impl WorldState {
 
         let corp_ids: Vec<CorpId> = self.corporations.keys().collect();
 
-        // 5A. Pay daily non-capitalized wages (Retailers pay WageEarners; all corporations pay ManagersSkilled)
+        // 5A. Pay daily non-capitalized wages (Retailers pay WageEarners proportionally to active stock/sales;
+        // all corporations pay ManagersSkilled only when operating above their 5-day survival reserve)
         for &corp_id in &corp_ids {
-            let (entity_id, role, wage_bill, mgr_bill) = {
+            let (entity_id, role, wage_bill, mgr_bill, has_stock_or_sales) = {
                 let Some(c) = self.corporations.get(corp_id) else {
                     continue;
                 };
-                (c.entity_id, c.role, c.daily_wage_bill, c.daily_manager_bill)
+                let active_ops = match c.role {
+                    CorporationRole::Retailer { retail_sku } => {
+                        c.inventory_lot(retail_sku).total_qty() > 0 || c.monthly_units_sold > 0
+                    }
+                    CorporationRole::Manufacturer { output_sku, .. }
+                    | CorporationRole::ResourceExtractor { output_sku } => {
+                        c.inventory_lot(output_sku).total_qty() > 0 || c.monthly_units_output > 0
+                    }
+                };
+                (
+                    c.entity_id,
+                    c.role,
+                    c.daily_wage_bill,
+                    c.daily_manager_bill,
+                    active_ops,
+                )
             };
+
+            let survival_floor = wage_bill.checked_add(mgr_bill)?.checked_mul_u64(5)?;
 
             if matches!(role, CorporationRole::Retailer { .. }) && wage_bill.is_positive() {
                 let avail = self.ledger.available_cash(entity_id)?;
-                let pay = wage_bill.min(avail);
-                if pay.is_positive() {
-                    self.post_payroll_transfer(tick, entity_id, wage_entity, pay)?;
+                if avail > survival_floor {
+                    let effective_wage = if has_stock_or_sales {
+                        wage_bill
+                    } else {
+                        Money::from_cents(wage_bill.cents() / 4)
+                    };
+                    let pay = effective_wage.min(avail.checked_sub(survival_floor)?);
+                    if pay.is_positive() {
+                        self.post_payroll_transfer(tick, entity_id, wage_entity, pay)?;
+                    }
                 }
             }
 
             if mgr_bill.is_positive() {
                 let avail = self.ledger.available_cash(entity_id)?;
-                let pay = mgr_bill.min(avail);
-                if pay.is_positive() {
-                    self.post_payroll_transfer(tick, entity_id, mgr_entity, pay)?;
+                if avail > survival_floor {
+                    let effective_mgr = if has_stock_or_sales {
+                        mgr_bill
+                    } else {
+                        Money::from_cents(mgr_bill.cents() / 4)
+                    };
+                    let pay = effective_mgr.min(avail.checked_sub(survival_floor)?);
+                    if pay.is_positive() {
+                        self.post_payroll_transfer(tick, entity_id, mgr_entity, pay)?;
+                    }
                 }
             }
         }
 
-        // 5B. Daily 30/360 Loan Interest & Deposit Interest Accruals
+        // 5B. Daily 30/360 Loan Interest & Deposit Interest Accruals (preserving 5-day survival working-capital floor)
         for &corp_id in &corp_ids {
             let Some(c) = self.corporations.get(corp_id) else {
                 continue;
             };
             let entity_id = c.entity_id;
+            let survival_floor = c
+                .daily_wage_bill
+                .checked_add(c.daily_manager_bill)?
+                .checked_mul_u64(5)?;
             self.bank
-                .accrue_and_collect_daily_loan_interest(&mut self.ledger, tick, entity_id)?;
+                .accrue_and_collect_daily_loan_interest_with_floor(
+                    &mut self.ledger,
+                    tick,
+                    entity_id,
+                    survival_floor,
+                )?;
             self.bank
                 .accrue_and_pay_daily_deposit_interest(&mut self.ledger, tick, entity_id)?;
         }
@@ -1398,8 +1475,9 @@ impl WorldState {
             )?;
         }
 
-        // 5C. Monthly Dividend Distribution (at Day 30 of each month)
+        // 5C. Monthly Dividend Distribution & Bank Net Interest Income Recycling (at Day 30 of each month)
         if self.current_tick.is_month_end() {
+            self.recycle_monthly_bank_net_income(tick)?;
             for &corp_id in &corp_ids {
                 self.distribute_monthly_dividend(tick, corp_id)?;
             }
@@ -1456,36 +1534,128 @@ impl WorldState {
         Ok(())
     }
 
-    fn distribute_monthly_dividend(&mut self, tick: u64, corp_id: CorpId) -> Result<(), CoreError> {
-        let (entity_id, payout_bps, wage_floor) = {
-            let Some(c) = self.corporations.get(corp_id) else {
-                return Ok(());
-            };
-            if c.target_dividend_payout_bps == 0 {
-                return Ok(());
-            }
-            let daily_pay = c.daily_wage_bill.checked_add(c.daily_manager_bill)?;
-            (
-                c.entity_id,
-                c.target_dividend_payout_bps,
-                daily_pay.checked_mul_u64(15)?,
-            )
-        };
-
-        let report = FinancialStatementReport::generate(&self.ledger, entity_id, tick)?;
+    /// Recycles 85% of positive monthly `Central & Commercial Bank` net interest income back into
+    /// household deposits (`35%` as bank staff salaries to `ManagersSkilled`, `50%` as bank dividends
+    /// to `CapitalistsExecutives`), preventing debt-service spreads from permanently shrinking M1.
+    fn recycle_monthly_bank_net_income(&mut self, tick: u64) -> Result<(), CoreError> {
+        let bank_id = self.bank.bank_id()?;
+        let report = FinancialStatementReport::generate(&self.ledger, bank_id, tick)?;
         if !report.net_income.is_positive() {
             return Ok(());
         }
 
+        let Some((_, mgr_entity, cap_entity)) = self.all_cohort_entities() else {
+            return Ok(());
+        };
+
+        let (staff_wages, _) = report.net_income.mul_div_rem_u64(3_500, BPS_DENOMINATOR)?;
+        let (bank_dividends, _) = report.net_income.mul_div_rem_u64(5_000, BPS_DENOMINATOR)?;
+
+        let bank_wage_exp = self
+            .ledger
+            .entity_account_id(bank_id, StandardAccountCode::WageExpense)?;
+        let bank_re = self
+            .ledger
+            .entity_account_id(bank_id, StandardAccountCode::RetainedEarnings)?;
+        let bank_dep_liab = self
+            .ledger
+            .entity_account_id(bank_id, StandardAccountCode::CustomerDepositsLiability)?;
+        let mgr_cash = self
+            .ledger
+            .entity_account_id(mgr_entity, StandardAccountCode::CashAndDeposits)?;
+        let mgr_rev = self
+            .ledger
+            .entity_account_id(mgr_entity, StandardAccountCode::SalesRevenue)?;
+        let cap_cash = self
+            .ledger
+            .entity_account_id(cap_entity, StandardAccountCode::CashAndDeposits)?;
+        let cap_div = self
+            .ledger
+            .entity_account_id(cap_entity, StandardAccountCode::DividendIncome)?;
+
+        let mut entry = JournalEntry::new(tick, "Monthly Bank Net Interest Income Recycling");
+        let mut posted_any = false;
+        if staff_wages.is_positive() {
+            entry = entry
+                .debit(bank_wage_exp, staff_wages)
+                .credit(bank_dep_liab, staff_wages)
+                .debit(mgr_cash, staff_wages)
+                .credit(mgr_rev, staff_wages);
+            posted_any = true;
+        }
+        if bank_dividends.is_positive() {
+            entry = entry
+                .debit(bank_re, bank_dividends)
+                .credit(bank_dep_liab, bank_dividends)
+                .debit(cap_cash, bank_dividends)
+                .credit(cap_div, bank_dividends);
+            posted_any = true;
+        }
+
+        if posted_any {
+            self.ledger.post_entry(&entry)?;
+        }
+        Ok(())
+    }
+
+    fn distribute_monthly_dividend(&mut self, tick: u64, corp_id: CorpId) -> Result<(), CoreError> {
+        let (entity_id, payout_bps, working_floor, idle_cash_ceiling) = {
+            let Some(c) = self.corporations.get(corp_id) else {
+                return Ok(());
+            };
+            let debt = self
+                .bank
+                .loans
+                .get(&c.entity_id)
+                .map_or(Money::ZERO, |l| l.principal_outstanding);
+            let floor =
+                c.working_capital_floor(20, debt, self.bank.default_loan_rate_bps)?;
+            let ceiling =
+                c.working_capital_floor(180, debt, self.bank.default_loan_rate_bps)?;
+            (c.entity_id, c.target_dividend_payout_bps, floor, ceiling)
+        };
+
         let avail_cash = self.ledger.available_cash(entity_id)?;
-        if avail_cash <= wage_floor {
+        if avail_cash <= working_floor {
             return Ok(());
         }
-        let distributable_cash = avail_cash.checked_sub(wage_floor)?;
-        let (desired_div, _) = report
-            .net_income
-            .mul_div_rem_u64(u64::from(payout_bps), BPS_DENOMINATOR)?;
-        let total_dividend = desired_div.min(distributable_cash);
+
+        let report = FinancialStatementReport::generate(&self.ledger, entity_id, tick)?;
+        let regular_div = if report.net_income.is_positive() && payout_bps > 0 {
+            let (d, _) = report
+                .net_income
+                .mul_div_rem_u64(u64::from(payout_bps), BPS_DENOMINATOR)?;
+            d
+        } else {
+            Money::ZERO
+        };
+
+        // Mandatory excess-cash debt amortization & dividend sweep:
+        // If available cash exceeds 180 days of operating expenses, first pay down up to 50% of excess toward
+        // any outstanding bank debt, then distribute 50% of remaining excess above the 180-day ceiling to shareholders.
+        let excess_hoard_sweep = if avail_cash > idle_cash_ceiling {
+            let excess = avail_cash.checked_sub(idle_cash_ceiling)?;
+            let debt_paydown = Money::from_cents(excess.cents() / 2);
+            let repaid = if debt_paydown.is_positive() {
+                self.bank
+                    .repay_loan_principal(&mut self.ledger, tick, entity_id, debt_paydown)?
+            } else {
+                Money::ZERO
+            };
+            let remaining_excess = excess.checked_sub(repaid)?;
+            Money::from_cents(remaining_excess.cents() / 2)
+        } else {
+            Money::ZERO
+        };
+
+        let fresh_avail = self.ledger.available_cash(entity_id)?;
+        if fresh_avail <= working_floor {
+            return Ok(());
+        }
+        let fresh_distributable = fresh_avail.checked_sub(working_floor)?;
+
+        let desired_div = regular_div.max(excess_hoard_sweep);
+        let total_dividend = desired_div.min(fresh_distributable);
         if !total_dividend.is_positive() {
             return Ok(());
         }
@@ -1537,16 +1707,22 @@ impl WorldState {
     }
 
     fn wage_and_manager_entities(&self) -> Option<(EntityId, EntityId)> {
+        let (w, m, _) = self.all_cohort_entities()?;
+        Some((w, m))
+    }
+
+    fn all_cohort_entities(&self) -> Option<(EntityId, EntityId, EntityId)> {
         let mut wage = None;
         let mut mgr = None;
+        let mut cap = None;
         for (_, c) in &self.cohorts {
             match c.kind {
                 HouseholdCohortKind::WageEarners => wage = Some(c.entity_id),
                 HouseholdCohortKind::ManagersSkilled => mgr = Some(c.entity_id),
-                HouseholdCohortKind::CapitalistsExecutives => {}
+                HouseholdCohortKind::CapitalistsExecutives => cap = Some(c.entity_id),
             }
         }
-        Some((wage?, mgr?))
+        Some((wage?, mgr?, cap?))
     }
 
     /// Audits both:

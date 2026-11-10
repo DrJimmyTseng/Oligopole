@@ -453,7 +453,7 @@ mod tests {
 
         // Verify SQLite byte-order sortability on `net_income_be16` at tick 60
         let ranked = store.query_corporations_by_net_income_desc(60).unwrap();
-        assert_eq!(ranked.len(), 5);
+        assert_eq!(ranked.len(), 6);
         for pair in ranked.windows(2) {
             let [(_, inc_a), (_, inc_b)] = pair else {
                 continue;

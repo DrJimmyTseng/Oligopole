@@ -17,6 +17,7 @@ pub struct VerticalSliceHandles {
     pub appliance_sku: SkuId,
     pub iron_cmdty_book: InstrumentId,
     pub iron_corp: CorpId,
+    pub vale_corp: CorpId,
     pub acme_corp: CorpId,
     pub zenith_corp: CorpId,
     pub player_retail_corp: CorpId,
@@ -131,7 +132,7 @@ pub fn build_vertical_slice_0(
         brand_affinity: dec!(2.2),
     });
 
-    // 5. Register the 5 Corporations + their Equity CLOBs
+    // 5. Register the 6 Corporations (2 Extractors, 2 Manufacturers, 2 Retailers) + their Equity CLOBs
     let iron_corp = register_slice_corporation(
         &mut world,
         "IRON",
@@ -140,16 +141,37 @@ pub fn build_vertical_slice_0(
             output_sku: iron_ore_sku,
         },
         AiDelegationConfig::autonomous_rival(),
-        Money::from_dollars(500_000),
-        120,
-        Money::from_dollars(2_800),
-        Money::from_dollars(700),
-        Money::from_dollars(42),
+        Money::from_dollars(480_000),
+        65,
+        Money::from_dollars(1_550),
+        Money::from_dollars(450),
+        Money::from_dollars(43),
         Money::from_dollars(10),
+        10_200,
         10_000,
-        10_000,
-        3_000,
-        Money::from_dollars(25),
+        3_500,
+        Money::from_dollars(26),
+        (wage_entity, mgr_entity, cap_entity),
+    )?;
+
+    let vale_corp = register_slice_corporation(
+        &mut world,
+        "VALE",
+        "Vale Basin Resources Corp",
+        CorporationRole::ResourceExtractor {
+            output_sku: iron_ore_sku,
+        },
+        AiDelegationConfig::autonomous_rival(),
+        Money::from_dollars(460_000),
+        60,
+        Money::from_dollars(1_450),
+        Money::from_dollars(420),
+        Money::from_dollars(41),
+        Money::from_dollars(10),
+        9_900,
+        9_800,
+        3_500,
+        Money::from_dollars(24),
         (wage_entity, mgr_entity, cap_entity),
     )?;
 
@@ -257,6 +279,7 @@ pub fn build_vertical_slice_0(
             appliance_sku,
             iron_cmdty_book,
             iron_corp,
+            vale_corp,
             acme_corp,
             zenith_corp,
             player_retail_corp,

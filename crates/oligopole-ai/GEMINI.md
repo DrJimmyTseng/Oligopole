@@ -5,10 +5,10 @@
 
 ## 2. Core Modules
 - **`observation.rs`:** `ActorObservationView` (private ledger/inventory + lagged quarterly public filings of rivals + noisy market estimates).
-- **`candidate.rs`:** `JointActionTuple` (composite CapEx + Financing options) and discrete policy dials (`PricingStance`, `WageStance`, `DividendPolicy`).
+- **`candidate.rs`:** `JointActionTuple` (composite CapEx + Financing options respecting a 20-day payroll + interest working-capital floor) and discrete policy dials (`PricingStance`, `WageStance`, `DividendPolicy`).
 - **`persona.rs`:** `PersonaBiasVector`, log-odds softmax modulation in `rust_decimal`, Hamilton basis-point normalization, and seeded `ChaCha8Rng` sampling.
 - **`protocol.rs` & `client.rs`:** Length-prefixed `msgpack` wire protocol (`noul`, `choice`, `score`) and advisory RTX 5090 `PingHandshake`.
-- **`system0.rs`:** Pure-Rust NPV & persona heuristic evaluator for 10,000-tick headless Monte Carlo benchmarks and offline tests.
+- **`system0.rs`:** Pure-Rust NPV & persona heuristic evaluator with 20-day working-capital retention and 180-day excess-cash dividend sweep priors for 10,000-tick headless Monte Carlo benchmarks and offline tests.
 
 ## 3. Invariants Verified by `proptest` & Integration Tests
 1. `modulate_and_sample_choice` normalizes log-odds shifted weights via `allocate_hamilton` to exact basis points summing to `10_000` and samples reproducibly from `seeded_actor_rng`.

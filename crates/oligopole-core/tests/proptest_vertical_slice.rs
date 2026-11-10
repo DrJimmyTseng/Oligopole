@@ -15,6 +15,19 @@ use proptest::prelude::*;
 #[test]
 fn test_vertical_slice_0_runs_360_days_full_year_invariants() {
     let (mut world, handles) = build_vertical_slice_0([7u8; 32]).unwrap();
+    assert_eq!(
+        world.corporations.len(),
+        6,
+        "Vertical Slice 0 should have 6 corporations (2 extractors, 2 manufacturers, 2 retailers)"
+    );
+
+    // Originate a test bank loan on Day 1 so the bank earns net interest spread and recycles it at month-end
+    world
+        .execute_command(PlayerCommand::RequestBankLoan {
+            corp_id: handles.acme_corp,
+            principal: Money::from_dollars(200_000),
+        })
+        .unwrap();
 
     for day in 1..=360 {
         let mut cmds = Vec::new();
@@ -60,6 +73,15 @@ fn test_vertical_slice_0_runs_360_days_full_year_invariants() {
         .find(|i| i.ticker == "IRON CMDTY")
         .unwrap();
     assert!(!iron_book.recent_fills.is_empty(), "expected commodity CLOB fills");
+
+    // Verify all solvent corporations maintained positive working capital above $0.00
+    for corp in &view.corporations {
+        assert!(
+            corp.available_cash.is_positive(),
+            "corporation {} should maintain positive working-capital cash buffer",
+            corp.ticker
+        );
+    }
 }
 
 proptest! {

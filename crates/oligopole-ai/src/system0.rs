@@ -103,8 +103,20 @@ impl DecisionPolicy for System0HeuristicPolicy {
             _ => WageStance::Raise5Pct,
         };
 
-        // 4. Dividend Stance priors
-        let div_priors: [u64; 4] = if obs.net_income.is_positive() {
+        // 4. Dividend Stance priors (including 180-day excess-cash hoard sweep bias)
+        let daily_payroll = obs.daily_wage_bill.checked_add(obs.daily_manager_bill)?;
+        let (daily_interest, _) = obs
+            .outstanding_debt
+            .mul_div_rem_u64(u64::from(obs.bank_loan_rate_bps), 360 * 10_000)?;
+        let daily_burn = daily_payroll.checked_add(daily_interest)?;
+        let excess_cash_ceiling = daily_burn.checked_mul_u64(180)?;
+        let working_floor = daily_burn.checked_mul_u64(20)?;
+
+        let div_priors: [u64; 4] = if obs.available_cash > excess_cash_ceiling {
+            [200, 800, 3_000, 6_000]
+        } else if obs.available_cash <= working_floor {
+            [8_500, 1_000, 400, 100]
+        } else if obs.net_income.is_positive() {
             [1_500, 3_500, 3_500, 1_500]
         } else {
             [7_000, 2_000, 800, 200]

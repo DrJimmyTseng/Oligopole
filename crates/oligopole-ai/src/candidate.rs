@@ -24,7 +24,11 @@ pub fn generate_joint_action_candidates(
     obs: &ActorObservationView,
 ) -> Result<Vec<CandidateOption>, AiError> {
     let daily_payroll = obs.daily_wage_bill.checked_add(obs.daily_manager_bill)?;
-    let working_floor = daily_payroll.checked_mul_u64(15)?;
+    let (daily_interest, _) = obs
+        .outstanding_debt
+        .mul_div_rem_u64(u64::from(obs.bank_loan_rate_bps), 360 * 10_000)?;
+    let daily_burn = daily_payroll.checked_add(daily_interest)?;
+    let working_floor = daily_burn.checked_mul_u64(20)?;
     let free_cash = if obs.available_cash > working_floor {
         obs.available_cash.checked_sub(working_floor)?
     } else {

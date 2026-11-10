@@ -9,9 +9,9 @@
 - **`clob.rs`:** `CentralLimitOrderBook` with price-time priority (`BTreeMap<Money, VecDeque<LimitOrder>>`), reservation-counter escrow (`reserved_cash`, `reserved_qty`, `reserved_shares`), and `OhlcvBar` aggregation.
 - **`b2b_market.rs`:** Scheduled bilateral supply contract tranche delivery and spot wholesale queue matching.
 - **`household.rs` & `retail_market.rs`:** 3 income cohorts (`WageEarners`, `ManagersSkilled`, `CapitalistsExecutives`), Stone-Geary subsistence reserve, clamped `[-20, 0]` scaling-and-squaring `pade_2_2(x / 32)^32` logit choice in `rust_decimal`, and Hamilton inventory rationing.
-- **`production.rs`:** Factory DAG recipes transforming input `WacInventoryLot`s + labor into output finished goods.
-- **`cfo.rs`:** Deterministic corporate finance constraint solver enforcing minimum cash buffers and debt service covenants.
-- **`world.rs` & `vertical_slice.rs`:** `WorldState` aggregate, 5-subphase Fast-Tick pipeline, `WorldView` snapshot projection, and Vertical Slice 0 ("Iron-to-Consumer + Equity CLOB").
+- **`production.rs`:** Factory DAG recipes transforming input `WacInventoryLot`s + labor into output finished goods, plus `Corporation::working_capital_floor` computing $N$-day payroll + 30/360 interest buffers.
+- **`cfo.rs`:** Deterministic corporate finance constraint solver enforcing 20-day working-capital floors and 3x working-capital debt service covenants.
+- **`world.rs` & `vertical_slice.rs`:** `WorldState` aggregate, 5-subphase Fast-Tick pipeline (with 85% monthly bank net interest recycling to households, 180-day excess-cash debt amortization & dividend sweeps, and 5-day survival working-capital protection), `WorldView` snapshot projection, and Vertical Slice 0 (6 corporations: `IRON` & `VALE` extractors, `ACME` & `ZENI` manufacturers, `PLYR` & `APEX` retailers).
 
 ## 3. Invariants Verified by `proptest`
 1. `pade_exp_neg(x)` is strictly positive `(0, 1]` and strictly monotonic across `[-20, 0]`, eliminating the raw Padé `(2,2)` numerator parabola minimum at `x = -3`.

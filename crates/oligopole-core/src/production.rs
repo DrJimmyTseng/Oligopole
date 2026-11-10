@@ -103,4 +103,18 @@ impl Corporation {
     pub fn inventory_lot_mut(&mut self, sku_id: SkuId) -> &mut WacInventoryLot {
         self.inventory.entry(sku_id).or_default()
     }
+
+    /// Computes the corporation's N-day working-capital floor (`days * (daily_wage_bill + daily_manager_bill + daily_loan_interest)`).
+    pub fn working_capital_floor(
+        &self,
+        days: u64,
+        outstanding_debt: Money,
+        loan_rate_bps: u32,
+    ) -> Result<Money, oligopole_ledger::LedgerError> {
+        let daily_payroll = self.daily_wage_bill.checked_add(self.daily_manager_bill)?;
+        let (daily_interest, _) = outstanding_debt
+            .mul_div_rem_u64(u64::from(loan_rate_bps), 360 * oligopole_ledger::BPS_DENOMINATOR)?;
+        let daily_burn = daily_payroll.checked_add(daily_interest)?;
+        daily_burn.checked_mul_u64(days)
+    }
 }
