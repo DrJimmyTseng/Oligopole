@@ -4,11 +4,20 @@ use oligopole_ledger::{EntityId, Money};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
-/// Market sector classification for Bloomberg terminal tickers (`IRON CMDTY`, `ACME EQ`).
+/// Market sector classification for Bloomberg terminal tickers (`IRON CMDTY`, `ACME EQ`, `GOOGL-DR`, `PLEX SC`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum InstrumentKind {
-    Commodity { sku_id: SkuId },
-    Equity { corp_id: CorpId },
+    Commodity {
+        sku_id: SkuId,
+    },
+    Equity {
+        corp_id: CorpId,
+    },
+    DepositaryReceipt {
+        symbol_code: [u8; 8],
+        quarterly_dividend_bps: u32,
+    },
+    ServiceCredit,
 }
 
 /// Direction of an order on the Central Limit Order Book.
@@ -75,6 +84,8 @@ pub struct CentralLimitOrderBook {
     pub ticker: String,
     pub kind: InstrumentKind,
     pub last_price: Money,
+    pub luld_reference_price: Money,
+    pub luld_band_bps: u32,
     pub bids: BTreeMap<Money, VecDeque<LimitOrder>>,
     pub asks: BTreeMap<Money, VecDeque<LimitOrder>>,
     pub current_day_bar: Option<OhlcvBar>,
@@ -95,12 +106,57 @@ impl CentralLimitOrderBook {
             ticker: ticker.into(),
             kind,
             last_price: reference_price,
+            luld_reference_price: reference_price,
+            luld_band_bps: 1_000,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             current_day_bar: None,
             history_bars: VecDeque::with_capacity(360),
             recent_fills: VecDeque::with_capacity(64),
             max_history_bars: 720,
+        }
+    }
+
+    /// Computes the `(lower_band, upper_band)` Limit-Up / Limit-Down (LULD) price circuit-breaker bounds.
+    pub fn luld_bounds(&self) -> (Money, Money) {
+        let ref_cents = self.luld_reference_price.cents().max(10);
+        let band = i128::from(self.luld_band_bps.min(9_000));
+        let lower = ((ref_cents * (10_000 - band)) / 10_000).max(1);
+        let upper = ((ref_cents * (10_000 + band)) / 10_000).max(lower + 1);
+        (Money::from_cents(lower), Money::from_cents(upper))
+    }
+
+    /// Validates that `limit_price` falls within the active LULD circuit-breaker band.
+    pub fn validate_luld_price(&self, limit_price: Money) -> Result<(), CoreError> {
+        if self.luld_band_bps == 0 {
+            return Ok(());
+        }
+        let (lower, upper) = self.luld_bounds();
+        if limit_price < lower || limit_price > upper {
+            return Err(CoreError::LuldBandViolation {
+                price: limit_price,
+                lower_band: lower,
+                upper_band: upper,
+            });
+        }
+        Ok(())
+    }
+
+    /// Clamps a candidate quote price to the active LULD band.
+    pub fn clamp_luld_price(&self, price: Money) -> Money {
+        if self.luld_band_bps == 0 {
+            return price;
+        }
+        let (lower, upper) = self.luld_bounds();
+        price.clamp(lower, upper)
+    }
+
+    /// Re-anchors `luld_reference_price` (and `last_price`) to `new_reference_price`
+    /// (used when external oracle ticks jump $>10\%$ on Depositary Receipts).
+    pub fn reanchor_luld_reference(&mut self, new_reference_price: Money) {
+        if new_reference_price.is_positive() {
+            self.luld_reference_price = new_reference_price;
+            self.last_price = new_reference_price;
         }
     }
 
@@ -443,6 +499,7 @@ impl CentralLimitOrderBook {
                 volume: 0,
             },
         };
+        self.luld_reference_price = self.last_price;
         self.push_history_bar(bar);
         bar
     }

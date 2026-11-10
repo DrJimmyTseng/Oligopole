@@ -1,5 +1,7 @@
 use crate::clob::OrderSide;
-use crate::ids::{CorpId, InstrumentId, OrderId, SkuId};
+use crate::ids::{CorpId, InstrumentId, OrderId, ShortLoanId, SkuId, WireMessageId};
+use crate::production::{CloudTier, CorporationRole};
+use crate::wire::{CrimeOperationKind, WireAttachment};
 use oligopole_ledger::{EntityId, Money};
 use serde::{Deserialize, Serialize};
 
@@ -156,4 +158,72 @@ pub enum PlayerCommand {
     },
     /// Apply a full Slow-Tick `StrategicDirective` (from `Clef-Flash` or `System0Heuristic`).
     ApplyStrategicDirective(StrategicDirective),
+    /// Authoritative payment webhook minting `ServiceCredit` (`PLEX`) units idempotently (`zero M1 impact`).
+    AuthorityMintServiceCredit {
+        recipient_entity_id: EntityId,
+        credits: u64,
+        webhook_ref: String,
+    },
+    /// Ingest an external delayed/live market oracle price tick on a `DepositaryReceipt` instrument,
+    /// re-anchoring its LULD $\pm 10\%$ circuit-breaker reference price.
+    IngestOraclePriceTick {
+        instrument_id: InstrumentId,
+        new_oracle_price: Money,
+    },
+    /// Incorporate a new private Brick-and-Mortar SME (`equity_instrument_id: None`) funded by `founder_entity_id`.
+    FoundPrivateSme {
+        founder_entity_id: EntityId,
+        ticker: String,
+        name: String,
+        role: CorporationRole,
+        seed_capital: Money,
+    },
+    /// Execute a programmatic GAAP IPO auction to take a private SME public on the Domestic Equity Board.
+    LaunchIpoAuction {
+        corp_id: CorpId,
+        primary_shares_to_issue: u64,
+        offer_price: Money,
+    },
+    /// Borrow physical `u64` shares from the `CapitalistsExecutives` institutional lending pool and sell short.
+    BorrowSharesToShort {
+        borrower_entity_id: EntityId,
+        corp_id: CorpId,
+        shares: u64,
+        sell_limit_price: Money,
+    },
+    /// Cover and close an open `ShortPositionRecord` by buying back shares and releasing remaining margin collateral.
+    CoverShortPosition {
+        short_loan_id: ShortLoanId,
+        max_buy_price: Money,
+    },
+    /// Execute a deterministic closed-loop organised crime operation (`HijackCargo`, `ExtortRetailer`, `CyberRansomware`, `CorporateWiretap`).
+    ExecuteCrimeOperation {
+        actor_corp_id: CorpId,
+        target_corp_id: CorpId,
+        kind: CrimeOperationKind,
+    },
+    /// Launder `amount` of `IllicitCash` into `CashAndDeposits` through a retail SME (`500 bps` tax + forensic audit check).
+    LaunderIllicitCash {
+        corp_id: CorpId,
+        amount: Money,
+    },
+    /// Configure a corporation's monthly `SovereignCloud` Web Services subscription tier.
+    SetCloudSubscriptionTier {
+        corp_id: CorpId,
+        tier: CloudTier,
+    },
+    /// Send an encrypted Corporate Wire (`MSG`) message with an optional 1-click `WireAttachment`.
+    SendWireMessage {
+        sender_corp_id: CorpId,
+        recipient_corp_id: CorpId,
+        subject: String,
+        body: String,
+        attachment: Option<WireAttachment>,
+    },
+    /// Accept or reject a pending `WireAttachment` on an incoming Corporate Wire (`MSG`) message.
+    RespondWireAttachment {
+        responder_corp_id: CorpId,
+        message_id: WireMessageId,
+        accept: bool,
+    },
 }

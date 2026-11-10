@@ -15,6 +15,7 @@ pub mod production;
 pub mod retail_market;
 pub mod snapshot;
 pub mod vertical_slice;
+pub mod wire;
 pub mod world;
 
 pub use b2b_market::{B2BSupplyContract, WholesaleSpotOffer};
@@ -32,11 +33,17 @@ pub use error::CoreError;
 pub use household::{
     HouseholdCohort, HouseholdCohortKind, RetailStoreOffer, decimal_bytes_serde, pade_exp_neg,
 };
-pub use ids::{CohortId, ContractId, CorpId, InstrumentId, OrderId, SkuId};
+pub use ids::{CohortId, ContractId, CorpId, InstrumentId, OrderId, ShortLoanId, SkuId, WireMessageId};
 pub use production::{
-    AiDelegationConfig, Corporation, CorporationRole, ExecutivePersonaKind, SkuDefinition,
+    AiDelegationConfig, CloudTier, Corporation, CorporationRole, ExecutivePersonaKind,
+    SkuDefinition,
 };
 pub use retail_market::{RetailSaleSettlement, compute_retail_clearing_plan};
 pub use snapshot::{CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, WorldView};
 pub use vertical_slice::{VerticalSliceHandles, build_vertical_slice_0};
+pub use wire::{
+    ClientWireFrame, ClobDeltaEvent, CrimeOperationKind, MAX_RESOLVED_WIRE_MESSAGES_PER_CORP,
+    ServerWireFrame, ServiceCreditPosition, ShortPositionRecord, WireAttachment,
+    WireAttachmentStatus, WireMessage,
+};
 pub use world::{EquityPosition, WorldState};

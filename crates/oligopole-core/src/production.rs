@@ -27,6 +27,63 @@ pub enum CorporationRole {
     },
     /// Procures finished goods wholesale from manufacturers and sells on B2C retail shelves to households.
     Retailer { retail_sku: SkuId },
+    /// Provides B2B freight transport capacity, earning per-unit freight tariffs and shielding cargo against hijacking.
+    LogisticsTrucking { freight_sku: SkuId },
+    /// Provides corporate security retainers, shielding clients against extortion, cargo hijacking, and wiretaps.
+    PrivateSecurity { protected_sku: SkuId },
+}
+
+/// Recurring monthly `SovereignCloud` Web Services subscription tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+pub enum CloudTier {
+    /// Unpaid / degraded offline POS mode (-50% retail brand effectiveness, L1-only book, AI/firewall disabled).
+    Offline,
+    /// Tier 1 ($1,000 VC or 1 ServiceCredit/mo): Standard POS clearing & `MSG` corporate wire.
+    #[default]
+    Tier1PosWire,
+    /// Tier 2 ($5,000 VC or 5 ServiceCredits/mo): Full 10-level L2 `OB` depth, multi-site `OPS` & Short-Locate Vault.
+    Tier2L2Telemetry,
+    /// Tier 3 ($15,000 VC or 15 ServiceCredits/mo): Autonomous `Clef-Flash` 9B delegation & Cyber-Defense Firewall.
+    Tier3ClefFirewall,
+}
+
+impl CloudTier {
+    pub const ALL: [Self; 4] = [
+        Self::Offline,
+        Self::Tier1PosWire,
+        Self::Tier2L2Telemetry,
+        Self::Tier3ClefFirewall,
+    ];
+
+    #[inline]
+    pub const fn monthly_service_credits(self) -> u64 {
+        match self {
+            Self::Offline => 0,
+            Self::Tier1PosWire => 1,
+            Self::Tier2L2Telemetry => 5,
+            Self::Tier3ClefFirewall => 15,
+        }
+    }
+
+    #[inline]
+    pub const fn monthly_vc_cost(self) -> Money {
+        match self {
+            Self::Offline => Money::ZERO,
+            Self::Tier1PosWire => Money::from_dollars(1_000),
+            Self::Tier2L2Telemetry => Money::from_dollars(5_000),
+            Self::Tier3ClefFirewall => Money::from_dollars(15_000),
+        }
+    }
+
+    #[inline]
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            Self::Offline => "OFFLINE (DEGRADED)",
+            Self::Tier1PosWire => "TIER 1: POS + WIRE",
+            Self::Tier2L2Telemetry => "TIER 2: L2 + VAULT",
+            Self::Tier3ClefFirewall => "TIER 3: CLEF + FIREWALL",
+        }
+    }
 }
 
 /// Executive persona archetype distinguishing corporate leadership behavior across the 6 firms.
@@ -136,6 +193,28 @@ pub struct Corporation {
     pub monthly_units_sold: u64,
     /// Trailing monthly dividend paid (for secondary Equity CLOB dividend-yield valuation).
     pub last_monthly_dividend_paid: Money,
+    /// Tick when this corporation was founded (used for the >= 90-day IPO GAAP operating history gate).
+    pub founded_tick: u64,
+    /// Optional founder `EntityId` subject to post-IPO share lockup escrow.
+    pub founder_entity_id: Option<EntityId>,
+    /// Tick until which `founder_locked_shares` cannot be sold on the CLOB (`180` ticks post-IPO).
+    pub founder_lockup_until_tick: u64,
+    /// Number of founder shares locked in post-IPO escrow.
+    pub founder_locked_shares: u64,
+    /// Currently active `SovereignCloud` tier (after month-end billing resolution).
+    pub cloud_tier: CloudTier,
+    /// Desired `SovereignCloud` subscription tier for next month-end billing cycle.
+    pub subscribed_cloud_tier: CloudTier,
+    /// Cumulative genuine `WacInventoryLot`-backed B2C retail revenue in the current month.
+    pub monthly_genuine_b2c_revenue: Money,
+    /// Cumulative `IllicitCash` laundered through retail placement in the current month.
+    pub monthly_laundered_cash: Money,
+    /// Tick until which `CyberRansomware` degrades `daily_capacity` by 40%.
+    pub ransomware_degraded_until_tick: u64,
+    /// Tick until which an active `PrivateSecurity` retainer shields against extortion & hijacking.
+    pub security_shield_until_tick: u64,
+    /// Tick until which an active `LogisticsTrucking` retainer shields B2B cargo deliveries.
+    pub logistics_shield_until_tick: u64,
 }
 
 impl Corporation {

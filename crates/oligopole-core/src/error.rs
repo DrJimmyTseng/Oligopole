@@ -1,5 +1,5 @@
-use crate::ids::{CorpId, InstrumentId, OrderId, SkuId};
-use oligopole_ledger::LedgerError;
+use crate::ids::{CorpId, InstrumentId, OrderId, ShortLoanId, SkuId, WireMessageId};
+use oligopole_ledger::{LedgerError, Money};
 use thiserror::Error;
 
 /// Canonical error type for `oligopole-core` simulation and market operations.
@@ -20,8 +20,27 @@ pub enum CoreError {
     #[error("unknown order id: {0:?}")]
     UnknownOrder(OrderId),
 
+    #[error("unknown short loan id: {0:?}")]
+    UnknownShortLoan(ShortLoanId),
+
+    #[error("unknown wire message id: {0:?}")]
+    UnknownWireMessage(WireMessageId),
+
     #[error("invalid order parameters: {reason}")]
     InvalidOrder { reason: String },
+
+    #[error("LULD circuit-breaker band violation: price {price} outside [{lower_band}, {upper_band}]")]
+    LuldBandViolation {
+        price: Money,
+        lower_band: Money,
+        upper_band: Money,
+    },
+
+    #[error("IPO GAAP listing gate violation: {reason}")]
+    IpoGateViolation { reason: String },
+
+    #[error("short-locate or margin violation: {reason}")]
+    ShortMarginViolation { reason: String },
 
     #[error("insufficient unreserved equity shares for {corp_id:?}: available {available}, requested {requested}")]
     InsufficientShares {

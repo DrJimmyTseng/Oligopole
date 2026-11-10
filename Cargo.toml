@@ -5,6 +5,7 @@ members = [
     "crates/oligopole-core",
     "crates/oligopole-ai",
     "crates/oligopole-store",
+    "crates/oligopole-server",
     "crates/oligopole-ui",
     "crates/oligopole-cli",
 ]
@@ -45,6 +46,7 @@ oligopole-ledger = { path = "crates/oligopole-ledger" }
 oligopole-core = { path = "crates/oligopole-core" }
 oligopole-ai = { path = "crates/oligopole-ai" }
 oligopole-store = { path = "crates/oligopole-store" }
+oligopole-server = { path = "crates/oligopole-server" }
 oligopole-ui = { path = "crates/oligopole-ui" }
 
 slotmap = { version = "1.0", features = ["serde"] }
@@ -65,4 +67,8 @@ egui = "0.31"
 egui_tiles = "0.12"
 egui_plot = "0.31"
 egui_extras = { version = "0.31", features = ["all_loaders"] }
+axum = { version = "0.8", features = ["ws", "json", "tokio"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+serde_json = "1.0"
 proptest = "1.6"

@@ -44,6 +44,7 @@ impl AccountCategory {
 pub enum StandardAccountCode {
     // --- Assets (Debit normal) ---
     CashAndDeposits,
+    IllicitCash,
     CentralBankReserves,
     InventoryRaw,
     InventoryWip,
@@ -68,6 +69,7 @@ pub enum StandardAccountCode {
     InterestIncome,
     DividendIncome,
     DebtExtinguishmentGain,
+    TaxAndFeeRevenue,
 
     // --- Expenses (Debit normal) ---
     CostOfGoodsSold,
@@ -77,6 +79,9 @@ pub enum StandardAccountCode {
     InterestExpense,
     BadDebtExpense,
     DepreciationExpense,
+    TaxAndFineExpense,
+    CloudServiceExpense,
+    SecurityAndFreightExpense,
 }
 
 impl StandardAccountCode {
@@ -84,6 +89,7 @@ impl StandardAccountCode {
     pub const fn category(self) -> AccountCategory {
         match self {
             Self::CashAndDeposits
+            | Self::IllicitCash
             | Self::CentralBankReserves
             | Self::InventoryRaw
             | Self::InventoryWip
@@ -103,7 +109,8 @@ impl StandardAccountCode {
             Self::SalesRevenue
             | Self::InterestIncome
             | Self::DividendIncome
-            | Self::DebtExtinguishmentGain => AccountCategory::Revenue,
+            | Self::DebtExtinguishmentGain
+            | Self::TaxAndFeeRevenue => AccountCategory::Revenue,
 
             Self::CostOfGoodsSold
             | Self::WageExpense
@@ -111,7 +118,10 @@ impl StandardAccountCode {
             | Self::MarketingExpense
             | Self::InterestExpense
             | Self::BadDebtExpense
-            | Self::DepreciationExpense => AccountCategory::Expense,
+            | Self::DepreciationExpense
+            | Self::TaxAndFineExpense
+            | Self::CloudServiceExpense
+            | Self::SecurityAndFreightExpense => AccountCategory::Expense,
         }
     }
 
@@ -121,6 +131,7 @@ impl StandardAccountCode {
         matches!(
             self,
             Self::CashAndDeposits
+                | Self::IllicitCash
                 | Self::CentralBankReserves
                 | Self::InventoryRaw
                 | Self::InventoryWip
@@ -131,11 +142,13 @@ impl StandardAccountCode {
                 | Self::CustomerDepositsLiability
                 | Self::LoansPayable
                 | Self::AccountsPayable
+                | Self::TaxesPayable
         )
     }
 
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 31] = [
         Self::CashAndDeposits,
+        Self::IllicitCash,
         Self::CentralBankReserves,
         Self::InventoryRaw,
         Self::InventoryWip,
@@ -154,6 +167,7 @@ impl StandardAccountCode {
         Self::InterestIncome,
         Self::DividendIncome,
         Self::DebtExtinguishmentGain,
+        Self::TaxAndFeeRevenue,
         Self::CostOfGoodsSold,
         Self::WageExpense,
         Self::ConsumptionExpense,
@@ -161,6 +175,9 @@ impl StandardAccountCode {
         Self::InterestExpense,
         Self::BadDebtExpense,
         Self::DepreciationExpense,
+        Self::TaxAndFineExpense,
+        Self::CloudServiceExpense,
+        Self::SecurityAndFreightExpense,
     ];
 }
 

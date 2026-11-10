@@ -23,8 +23,8 @@
 - **`allocate_hamilton` (`src/rounding.rs`):**
   - Largest Remainder pro-rata splitter over `(Id, u64)` weights sorted deterministically by `(Remainder DESC, Id ASC)`. Guarantees $\sum \text{shares}_i == \text{total}$.
 - **`LedgerEngine` & `JournalEntry` (`src/account.rs`, `src/journal.rs`):**
-  - Manages entity Charts of Accounts (`Asset`, `Liability`, `Equity`, `Revenue`, `Expense`) and `reserved_cash` escrow counters.
-  - Enforces $\sum \text{Debits} == \sum \text{Credits}$ on every `JournalEntry`, rejects negative cash/deposit balances on non-overdraft asset accounts, and audits global trial balance conservation.
+  - Manages entity Charts of Accounts (`Asset`, `Liability`, `Equity`, `Revenue`, `Expense`, including `IllicitCash`, `TaxAndFeeRevenue`, `TaxAndFineExpense`, `CloudServiceExpense`, and `SecurityAndFreightExpense`) and `reserved_cash` escrow counters.
+  - Enforces $\sum \text{Debits} == \sum \text{Credits}$ on every `JournalEntry`, rejects negative cash/deposit/tax-lien balances on non-overdraft accounts, and audits global trial balance and Dual-Cash M1 conservation ($\sum_{\text{non-bank}} (\text{CashAndDeposits} + \text{IllicitCash}) == \sum_{\text{bank}} \text{CustomerDepositsLiability}$).
 - **`CommercialBankFacility` (`src/bank.rs`):**
   - Endogenous loan origination (`Dr LoanReceivable / Cr CustomerDepositsLiability` on Bank books; `Dr CashAndDeposits / Cr LoansPayable` on Borrower books), principal amortization, 30/360 interest collection, and insolvency liquidation waterfall + equity write-down on default.
 - **`FinancialStatementReport` (`src/statement.rs`):**

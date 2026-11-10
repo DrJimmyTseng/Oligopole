@@ -233,3 +233,293 @@ proptest! {
         world.audit_world_invariants().unwrap();
     }
 }
+
+#[test]
+fn test_all_six_black_tape_invariant_guards_and_sme_ipo_pipeline() {
+    use oligopole_core::{
+        CorporationRole, CrimeOperationKind, MAX_RESOLVED_WIRE_MESSAGES_PER_CORP, WireAttachment,
+        WireAttachmentStatus,
+    };
+    use rand::RngCore;
+
+    let (mut world, handles) = build_vertical_slice_0([99u8; 32]).unwrap();
+    let plyr_id = handles.player_retail_corp;
+    let apex_id = handles.apex_retail_corp;
+    let acme_id = handles.acme_corp;
+    let plyr_entity = world.corporations.get(plyr_id).unwrap().entity_id;
+
+    // --- Guard #5: Webhook Idempotency & Dual-Clock (tick, seq_no) RNG ---
+    let initial_sc = world.total_service_credits_supply;
+    world
+        .execute_command_sequenced(
+            PlayerCommand::AuthorityMintServiceCredit {
+                recipient_entity_id: plyr_entity,
+                credits: 25,
+                webhook_ref: "wh_stripe_001".to_owned(),
+            },
+            1,
+        )
+        .unwrap();
+    assert_eq!(world.total_service_credits_supply, initial_sc + 25);
+
+    // Duplicate webhook_ref must be a no-op
+    world
+        .execute_command_sequenced(
+            PlayerCommand::AuthorityMintServiceCredit {
+                recipient_entity_id: plyr_entity,
+                credits: 25,
+                webhook_ref: "wh_stripe_001".to_owned(),
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(world.total_service_credits_supply, initial_sc + 25);
+
+    // Distinct seq_no produces distinct ChaCha8Rng streams
+    let rng_seq_1 = world.seeded_command_rng(1).next_u64();
+    let rng_seq_2 = world.seeded_command_rng(2).next_u64();
+    assert_ne!(rng_seq_1, rng_seq_2);
+
+    // --- Guard #3: Oracle LULD Re-Anchoring on >10% Real-World Gap ---
+    let googl_id = handles.googl_dr_book;
+    // Jump GOOGL-DR from $281.00 to $350.00 (+24.5% gap)
+    let new_oracle_px = Money::from_dollars(350);
+    world
+        .execute_command(PlayerCommand::IngestOraclePriceTick {
+            instrument_id: googl_id,
+            new_oracle_price: new_oracle_px,
+        })
+        .unwrap();
+    let googl_book = world.order_books.get(googl_id).unwrap();
+    assert_eq!(googl_book.luld_reference_price, new_oracle_px);
+    // Submitting a limit order near $350.00 succeeds without LuldBandViolation
+    world
+        .execute_command(PlayerCommand::SubmitClobOrder {
+            trader_entity_id: plyr_entity,
+            instrument_id: googl_id,
+            side: OrderSide::Bid,
+            limit_price: Money::from_dollars(354),
+            qty: 10,
+        })
+        .unwrap();
+
+    // --- Guard #2: Physical Share-Borrow Short-Locate, Dividend-in-Lieu & 115% Maintenance Margin ---
+    let acme_eq_id = world
+        .corporations
+        .get(acme_id)
+        .unwrap()
+        .equity_instrument_id
+        .unwrap();
+    let acme_px = world.order_books.get(acme_eq_id).unwrap().last_price;
+    world
+        .execute_command(PlayerCommand::BorrowSharesToShort {
+            borrower_entity_id: plyr_entity,
+            corp_id: acme_id,
+            shares: 200,
+            sell_limit_price: acme_px,
+        })
+        .unwrap();
+    assert_eq!(world.short_positions.len(), 1);
+    world.audit_world_invariants().unwrap();
+
+    // --- Crime, Laundering & Guard #4: Non-Negative Balance Protection on 150% Forensic Fines ---
+    // Extort cash into PLYR's IllicitCash (try multiple seq_nos to guarantee a successful roll)
+    for seq in 10..25 {
+        world
+            .execute_command_sequenced(
+                PlayerCommand::ExecuteCrimeOperation {
+                    actor_corp_id: plyr_id,
+                    target_corp_id: apex_id,
+                    kind: CrimeOperationKind::ExtortRetailer {
+                        demand_amount: Money::from_dollars(80_000),
+                    },
+                },
+                seq,
+            )
+            .unwrap();
+        if world
+            .ledger
+            .illicit_cash_balance(plyr_entity)
+            .unwrap()
+            .is_positive()
+        {
+            break;
+        }
+    }
+    let illicit_before = world.ledger.illicit_cash_balance(plyr_entity).unwrap();
+    assert!(illicit_before.is_positive(), "expected extortion to yield IllicitCash");
+
+    // Lock most of PLYR's clean cash in a resting Bid so a 150% fine exceeds unreserved cash and triggers a TaxLien
+    let avail_clean = world.ledger.available_cash(plyr_entity).unwrap();
+    let lock_budget = Money::from_cents((avail_clean.cents() * 95) / 100);
+    let iron_eq_id = world
+        .corporations
+        .get(handles.iron_corp)
+        .unwrap()
+        .equity_instrument_id
+        .unwrap();
+    let iron_bid_px = Money::from_dollars(25);
+    let lock_qty = u64::try_from(lock_budget.cents() / iron_bid_px.cents()).unwrap();
+    let (locked_order_id, _) = world
+        .submit_clob_limit_order(plyr_entity, iron_eq_id, OrderSide::Bid, iron_bid_px, lock_qty)
+        .unwrap();
+
+    // Launder all IllicitCash at once (> 2x safe ceiling -> 100% deterministic 150% fine trigger)
+    world
+        .execute_command_sequenced(
+            PlayerCommand::LaunderIllicitCash {
+                corp_id: plyr_id,
+                amount: illicit_before,
+            },
+            99,
+        )
+        .unwrap();
+    world.audit_world_invariants().unwrap();
+    assert!(
+        world
+            .tax_liens
+            .get(&plyr_entity)
+            .copied()
+            .unwrap_or(Money::ZERO)
+            .is_positive(),
+        "expected excess 150% forensic fine to book a senior TaxLienPayable without negative cash"
+    );
+
+    let _ = world.cancel_clob_limit_order(iron_eq_id, locked_order_id);
+
+    // --- Domestic Private SME -> IPO Gate Pipeline ---
+    let sme_id = world
+        .execute_found_private_sme(
+            plyr_entity,
+            "BOLT",
+            "Bolt FastFreight Logistics SME",
+            CorporationRole::LogisticsTrucking {
+                freight_sku: handles.appliance_sku,
+            },
+            Money::from_dollars(260_000),
+        )
+        .unwrap();
+    // Launching IPO before 90 ticks must fail
+    assert!(
+        world
+            .execute_launch_ipo_auction(sme_id, 20_000, Money::from_dollars(12))
+            .is_err()
+    );
+
+    // --- Guard #6: Information-Barrier Masking & Bounded Wire Messages ---
+    for i in 0..80 {
+        world
+            .execute_send_wire_message(
+                plyr_id,
+                apex_id,
+                format!("Wire #{i}"),
+                "Routine status ping".to_owned(),
+                None,
+            )
+            .unwrap();
+    }
+    assert!(
+        world.wire_messages.len() <= MAX_RESOLVED_WIRE_MESSAGES_PER_CORP,
+        "resolved wire messages must be bounded to MAX_RESOLVED_WIRE_MESSAGES_PER_CORP"
+    );
+
+    // Send an actionable B2B Smart Attachment and accept it
+    let msg_id = world
+        .execute_send_wire_message(
+            acme_id,
+            plyr_id,
+            "Wholesale Appliance Contract".to_owned(),
+            "10 units/day at $132".to_owned(),
+            Some(WireAttachment::B2BContractOffer {
+                sku_id: handles.appliance_sku,
+                daily_qty: 10,
+                unit_price: Money::from_dollars(132),
+                duration_days: 30,
+            }),
+        )
+        .unwrap();
+
+    // Rival IRON Corp cannot see ACME <-> PLYR private wire or PLYR's short positions
+    let iron_view = world
+        .build_authorized_world_view(Some(handles.iron_corp))
+        .unwrap();
+    assert!(
+        iron_view.wire_messages.is_empty(),
+        "uninvolved rival should not see private wire messages"
+    );
+    assert!(
+        iron_view.visible_short_positions.is_empty(),
+        "uninvolved rival should not see individual short positions"
+    );
+    let acme_inst = iron_view
+        .instruments
+        .iter()
+        .find(|i| i.instrument_id == acme_eq_id)
+        .unwrap();
+    assert_eq!(acme_inst.short_interest_shares, 200);
+
+    world
+        .execute_respond_wire_attachment(plyr_id, msg_id, true)
+        .unwrap();
+    let accepted_msg = world
+        .wire_messages
+        .iter()
+        .find(|m| m.message_id == msg_id)
+        .unwrap();
+    assert_eq!(accepted_msg.status, WireAttachmentStatus::Accepted);
+
+    // --- Guard #1: Sovereign Fiscal Recycling at Day 30 & 90-Tick SME IPO Unlock ---
+    // Give BOLT SME a retainer contract so its net_income > 0 after 90 ticks
+    let ret_msg = world
+        .execute_send_wire_message(
+            sme_id,
+            apex_id,
+            "Freight Shield Retainer".to_owned(),
+            "90-day armored freight".to_owned(),
+            Some(WireAttachment::ServiceRetainerOffer {
+                is_security: false,
+                daily_fee: Money::from_dollars(2_200),
+                duration_days: 90,
+            }),
+        )
+        .unwrap();
+    world
+        .execute_respond_wire_attachment(apex_id, ret_msg, true)
+        .unwrap();
+
+    for _ in 1..=91 {
+        world.step_fast_tick(&[]).unwrap();
+    }
+
+    // Give BOLT SME a fresh Q2 retainer so current-quarter net_income is also positive
+    let ret_msg_q2 = world
+        .execute_send_wire_message(
+            sme_id,
+            acme_id,
+            "Q2 Freight Shield Retainer".to_owned(),
+            "30-day armored freight".to_owned(),
+            Some(WireAttachment::ServiceRetainerOffer {
+                is_security: false,
+                daily_fee: Money::from_dollars(2_200),
+                duration_days: 30,
+            }),
+        )
+        .unwrap();
+    world
+        .execute_respond_wire_attachment(acme_id, ret_msg_q2, true)
+        .unwrap();
+
+    // Verify SovereignTreasury recycled surplus above $500k reserve at month-ends
+    let sov_cash = world.ledger.cash_balance(world.sovereign_entity_id).unwrap();
+    assert!(
+        sov_cash >= world.sovereign_dr_reserve_buffer,
+        "SovereignTreasury should maintain at least its DR reserve buffer"
+    );
+
+    // Now BOLT SME has >90 ticks operating history, >$250k equity, and positive net income -> IPO succeeds!
+    let bolt_eq_inst = world
+        .execute_launch_ipo_auction(sme_id, 25_000, Money::from_dollars(15))
+        .unwrap();
+    assert!(world.order_books.contains_key(bolt_eq_inst));
+    world.audit_world_invariants().unwrap();
+}

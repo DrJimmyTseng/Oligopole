@@ -1,13 +1,16 @@
-//! `oligopole-cli`: Composition root for Oligopole (`sim-bench`, `verify-replay`, `terminal`).
+//! `oligopole-cli`: Composition root for Oligopole / Black Tape (`sim-bench`, `verify-replay`, `terminal`, `serve`).
 
 use oligopole_ai::{
     ActorObservationView, AdaptiveDecisionPolicy, DEFAULT_CLEF_WORKER_ADDR, DecisionPolicy,
     PersonaBiasVector,
 };
 use oligopole_core::{PlayerCommand, build_vertical_slice_0};
+use oligopole_server::{ServerConfig, spawn_authoritative_server};
 use oligopole_store::{DecisionOutboxEntry, DecisionSourceKind, OligopoleStore, to_hex};
-use oligopole_ui::launch_native_terminal;
+use oligopole_ui::{launch_native_terminal, launch_remote_terminal};
 use std::env;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -101,6 +104,8 @@ fn run_cli() -> Result<(), String> {
         "terminal" => {
             let mut clef_addr: Option<String> = None;
             let mut save_path: Option<String> = None;
+            let mut connect_url: Option<String> = None;
+            let mut session_token = String::from("PLYR-TOKEN");
             let mut idx = 1usize;
             while idx < args.len() {
                 match args.get(idx).map(String::as_str) {
@@ -124,13 +129,89 @@ fn run_cli() -> Result<(), String> {
                             return Err("--save requires a file path".to_owned());
                         }
                     }
+                    Some("--connect") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            connect_url = Some(val.clone());
+                            idx += 2;
+                        } else {
+                            return Err("--connect requires a ws:// URL".to_owned());
+                        }
+                    }
+                    Some("--token") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            session_token.clone_from(val);
+                            idx += 2;
+                        } else {
+                            return Err("--token requires a session token string".to_owned());
+                        }
+                    }
                     other => return Err(format!("unknown argument: {other:?}")),
                 }
             }
-            run_terminal(clef_addr.as_deref(), save_path.as_deref())
+            if let Some(url) = connect_url {
+                launch_remote_terminal(&url, &session_token)
+            } else {
+                run_terminal(clef_addr.as_deref(), save_path.as_deref())
+            }
+        }
+        "serve" => {
+            let mut config = ServerConfig::default();
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args.get(idx).map(String::as_str) {
+                    Some("--bind") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            config.bind_addr = val.parse::<SocketAddr>().map_err(|e| e.to_string())?;
+                            idx += 2;
+                        } else {
+                            return Err("--bind requires a host:port address".to_owned());
+                        }
+                    }
+                    Some("--save") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            config.save_path = Some(PathBuf::from(val));
+                            idx += 2;
+                        } else {
+                            return Err("--save requires a file path".to_owned());
+                        }
+                    }
+                    Some("--tick-ms") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            config.tick_ms = val.parse::<u64>().map_err(|e| e.to_string())?;
+                            idx += 2;
+                        } else {
+                            return Err("--tick-ms requires milliseconds".to_owned());
+                        }
+                    }
+                    Some("--webhook-secret") => {
+                        if let Some(val) = args.get(idx + 1) {
+                            config.webhook_secret.clone_from(val);
+                            idx += 2;
+                        } else {
+                            return Err("--webhook-secret requires a secret string".to_owned());
+                        }
+                    }
+                    Some("--clef-flash") => {
+                        let next_is_addr = args
+                            .get(idx + 1)
+                            .is_some_and(|v| !v.starts_with("--"));
+                        let addr_str = if next_is_addr {
+                            let s = args.get(idx + 1).cloned().unwrap_or_default();
+                            idx += 2;
+                            s
+                        } else {
+                            idx += 1;
+                            DEFAULT_CLEF_WORKER_ADDR.to_owned()
+                        };
+                        config.clef_flash_addr = Some(addr_str.parse::<SocketAddr>().map_err(|e| e.to_string())?);
+                    }
+                    other => return Err(format!("unknown argument: {other:?}")),
+                }
+            }
+            run_serve(config)
         }
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'sim-bench', 'verify-replay', or 'terminal'."
+            "unknown subcommand '{other}'. Expected 'sim-bench', 'verify-replay', 'terminal', or 'serve'."
         )),
     }
 }
@@ -274,4 +355,23 @@ fn run_verify_replay(path: &str) -> Result<(), String> {
 fn run_terminal(clef_addr: Option<&str>, save_path: Option<&str>) -> Result<(), String> {
     let (world, _) = build_vertical_slice_0([42u8; 32]).map_err(|e| e.to_string())?;
     launch_native_terminal(world, clef_addr, save_path)
+}
+
+fn run_serve(config: ServerConfig) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async move {
+        let server = spawn_authoritative_server(config)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "BLACK TAPE Authoritative Multiplayer Server listening on ws://{}/ws",
+            server.local_addr
+        );
+        // Keep server running until process termination
+        std::future::pending::<()>().await;
+        Ok(())
+    })
 }

@@ -6,11 +6,14 @@ use crate::theme::{
 };
 use egui::{Context, RichText, TopBottomPanel, Ui, WidgetText};
 use egui_tiles::{SimplificationOptions, Tile, TileId, Tiles, Tree, UiResponse};
+use futures_util::{SinkExt, StreamExt};
 use oligopole_ai::{
     ActorObservationView, AdaptiveDecisionPolicy, AiBackendStatus, DecisionPolicy,
     PersonaBiasVector,
 };
-use oligopole_core::{PlayerCommand, WorldState, WorldView};
+use oligopole_core::{
+    ClientWireFrame, PlayerCommand, ServerWireFrame, WorldState, WorldView, build_vertical_slice_0,
+};
 use oligopole_store::{DecisionOutboxEntry, DecisionSourceKind, OligopoleStore, to_hex};
 use std::path::Path;
 use std::sync::{
@@ -102,7 +105,7 @@ impl OligopoleTerminalApp {
             registry: ChannelLinkRegistry::default(),
             command_input: String::from("PLYR EQ FA"),
             command_status: String::from(
-                "READY • Keys: `/` or `Ctrl+K` Command Bar | `Space` Pause | `F1-F6` Panes | `Ctrl+S` Save Checkpoint",
+                "READY • Keys: `/` or `Ctrl+K` Command Bar | `Space` Pause | `F1-F7` Panes (`F7` = MSG Wire) | `Ctrl+S` Save Checkpoint",
             ),
             view_rx,
             latest_view,
@@ -151,9 +154,14 @@ impl OligopoleTerminalApp {
             LinkChannel::ChannelA,
             "PLYR",
         ));
+        let p_wire = tiles.insert_pane(TerminalPane::new(
+            TerminalMnemonic::CorporateWire,
+            LinkChannel::ChannelA,
+            "PLYR",
+        ));
 
         let top_row = tiles.insert_horizontal_tile(vec![p_monitor, p_chart, p_book]);
-        let bottom_row = tiles.insert_horizontal_tile(vec![p_fin, p_dag, p_exec]);
+        let bottom_row = tiles.insert_horizontal_tile(vec![p_fin, p_dag, p_exec, p_wire]);
         let root = tiles.insert_vertical_tile(vec![top_row, bottom_row]);
 
         Tree::new("oligopole_bloomberg_workspace", root, tiles)
@@ -253,7 +261,7 @@ impl OligopoleTerminalApp {
             }
         }
 
-        // `F1–F6` institutional function keys route directly to the 6 Bloomberg panes
+        // `F1–F7` institutional function keys route directly to the 7 Bloomberg panes
         for (key, mnemonic) in [
             (egui::Key::F1, TerminalMnemonic::MarketMonitor),
             (egui::Key::F2, TerminalMnemonic::GraphPrice),
@@ -261,6 +269,7 @@ impl OligopoleTerminalApp {
             (egui::Key::F4, TerminalMnemonic::FinancialAnalysis),
             (egui::Key::F5, TerminalMnemonic::OperationsDag),
             (egui::Key::F6, TerminalMnemonic::ExecutiveTicket),
+            (egui::Key::F7, TerminalMnemonic::CorporateWire),
         ] {
             if ctx.input(|i| i.key_pressed(key)) {
                 self.route_to_pane(mnemonic, None);
@@ -350,8 +359,11 @@ impl eframe::App for OligopoleTerminalApp {
                 ui.separator();
                 ui.label(
                     RichText::new(format!(
-                        "M1: {} | Bank Loans: {}",
-                        self.latest_view.total_m1_money_supply, self.latest_view.total_bank_loans
+                        "M1: {} | Loans: {} | Sov Reserve: {} | SC Supply: {}",
+                        self.latest_view.total_m1_money_supply,
+                        self.latest_view.total_bank_loans,
+                        self.latest_view.sovereign_cash_balance,
+                        self.latest_view.total_service_credits_supply
                     ))
                     .color(EMERALD_ACCENT),
                 );
@@ -468,7 +480,8 @@ pub fn spawn_simulation_thread(
             while save_rx.try_recv().is_ok() {
                 if let Ok(hash) = store.save_checkpoint(&world, &pending_outbox) {
                     pending_outbox.clear();
-                    let short_hash = &to_hex(&hash)[..12];
+                    let hex_full = to_hex(&hash);
+                    let short_hash = hex_full.get(..12).unwrap_or(&hex_full);
                     let _ = save_status_tx.send(format!(
                         "SAVED {save_target_name} @ T{} (blake3: {short_hash}…)",
                         world.current_tick.0
@@ -545,7 +558,8 @@ pub fn spawn_simulation_thread(
             if world.current_tick.0.is_multiple_of(360) {
                 if let Ok(hash) = store.save_checkpoint(&world, &pending_outbox) {
                     pending_outbox.clear();
-                    let short_hash = &to_hex(&hash)[..12];
+                    let hex_full = to_hex(&hash);
+                    let short_hash = hex_full.get(..12).unwrap_or(&hex_full);
                     let _ = save_status_tx.send(format!(
                         "AUTO-SAVED {save_target_name} @ T{} (blake3: {short_hash}…)",
                         world.current_tick.0
@@ -578,6 +592,164 @@ pub fn spawn_simulation_thread(
         ai_status_rx,
         save_status_rx,
     ))
+}
+
+/// Spawns a background Tokio WebSocket client thread connecting `OligopoleTerminalApp` to a remote
+/// authoritative `oligopole-server` instance (`ws://...`).
+///
+/// Applies incoming `ServerWireFrame::ClobDelta` frames immediately to the cached `WorldView`
+/// and replaces the full snapshot on `100ms` (10 Hz) coalesced `ServerWireFrame::WorldViewUpdate` frames.
+pub fn spawn_remote_websocket_client(
+    ws_url: &str,
+    session_token: &str,
+) -> Result<SimulationThreadHandles, String> {
+    let (dummy_world, _) = build_vertical_slice_0([0u8; 32]).map_err(|e| e.to_string())?;
+    let initial_view = Arc::new(dummy_world.build_world_view().map_err(|e| e.to_string())?);
+    let (view_tx, view_rx) = watch::channel(initial_view.clone());
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PlayerCommand>();
+    let (save_tx, mut save_rx) = mpsc::unbounded_channel::<()>();
+    let speed_mode = Arc::new(AtomicU32::new(SPEED_NORMAL));
+    let (ai_status_tx, ai_status_rx) = watch::channel(AiBackendStatus::System0Heuristic {
+        reason: Some(format!("REMOTE SERVER: {ws_url}")),
+    });
+    let (save_status_tx, save_status_rx) =
+        watch::channel(format!("CONNECTING TO {ws_url} (Token: {session_token})…"));
+
+    let url_owned = ws_url.to_owned();
+    let token_owned = session_token.to_owned();
+
+    thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(&url_owned).await else {
+                let _ = save_status_tx.send(format!("CONNECTION FAILED: {url_owned}"));
+                return;
+            };
+            let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+            // Send Authenticate frame immediately
+            if let Ok(auth_bytes) = rmp_serde::to_vec(&ClientWireFrame::Authenticate {
+                token: token_owned.clone(),
+            }) {
+                let _ = ws_tx
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(
+                        auth_bytes.into(),
+                    ))
+                    .await;
+            }
+
+            let mut cached_view: WorldView = (*initial_view).clone();
+
+            loop {
+                tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        if let Ok(buf) = rmp_serde::to_vec(&ClientWireFrame::SubmitCommand(cmd)) {
+                            if ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(buf.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(()) = save_rx.recv() => {
+                        if let Ok(buf) = rmp_serde::to_vec(&ClientWireFrame::RequestCheckpointSave) {
+                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(buf.into())).await;
+                        }
+                    }
+                    maybe_msg = ws_rx.next() => {
+                        let Some(Ok(msg)) = maybe_msg else {
+                            let _ = save_status_tx.send(format!("DISCONNECTED FROM {url_owned}"));
+                            break;
+                        };
+                        if let tokio_tungstenite::tungstenite::Message::Binary(bytes) = msg {
+                            let Ok(frame) = rmp_serde::from_slice::<ServerWireFrame>(&bytes) else {
+                                continue;
+                            };
+                            match frame {
+                                ServerWireFrame::Authenticated { server_motd, .. } => {
+                                    let _ = save_status_tx.send(format!("ONLINE: {server_motd}"));
+                                    let _ = ai_status_tx.send(AiBackendStatus::ClefFlashConnected {
+                                        addr: url_owned.clone(),
+                                        device_name: "Authoritative Multiplayer Server".to_owned(),
+                                        dtype: "Dual-Clock".to_owned(),
+                                    });
+                                }
+                                ServerWireFrame::ClobDelta(delta) => {
+                                    if let Some(inst) = cached_view
+                                        .instruments
+                                        .iter_mut()
+                                        .find(|i| i.instrument_id == delta.instrument_id)
+                                    {
+                                        inst.last_price = delta.last_price;
+                                        inst.best_bid = delta.best_bid;
+                                        inst.best_ask = delta.best_ask;
+                                        inst.top_bids = delta.top_bids;
+                                        inst.top_asks = delta.top_asks;
+                                        inst.recent_fills = delta.recent_fills;
+                                    }
+                                    let _ = view_tx.send(Arc::new(cached_view.clone()));
+                                }
+                                ServerWireFrame::WorldViewUpdate(new_view) => {
+                                    cached_view = *new_view;
+                                    let _ = view_tx.send(Arc::new(cached_view.clone()));
+                                }
+                                ServerWireFrame::CommandRejected { reason } => {
+                                    let _ = save_status_tx.send(format!("REJECTED: {reason}"));
+                                }
+                                ServerWireFrame::CheckpointSaved { tick, blake3_hex } => {
+                                    let short = blake3_hex.get(..12).unwrap_or(&blake3_hex);
+                                    let _ = save_status_tx.send(format!("SERVER SAVED @ T{tick} (blake3: {short}…)"));
+                                }
+                                ServerWireFrame::Pong { .. } => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    Ok((
+        view_rx,
+        cmd_tx,
+        save_tx,
+        speed_mode,
+        ai_status_rx,
+        save_status_rx,
+    ))
+}
+
+/// Launches the native 120 FPS `eframe` / `egui_tiles` Bloomberg Terminal connected over WebSocket
+/// to a remote authoritative `oligopole-server`.
+pub fn launch_remote_terminal(ws_url: &str, session_token: &str) -> Result<(), String> {
+    let (view_rx, cmd_tx, save_tx, speed_mode, ai_status_rx, save_status_rx) =
+        spawn_remote_websocket_client(ws_url, session_token)?;
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(format!("BLACK TAPE TERMINAL — Connected to {ws_url}"))
+            .with_inner_size([1560.0_f32, 920.0_f32]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Black Tape Multiplayer Terminal",
+        native_options,
+        Box::new(move |_cc| {
+            Ok(Box::new(OligopoleTerminalApp::new(
+                view_rx,
+                cmd_tx,
+                save_tx,
+                speed_mode,
+                ai_status_rx,
+                save_status_rx,
+            )))
+        }),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Launches the native 120 FPS `eframe` / `egui_tiles` Bloomberg Terminal window for `world`.

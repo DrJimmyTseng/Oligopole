@@ -13,16 +13,19 @@ pub enum TerminalMnemonic {
     OperationsDag,
     /// `EX`: Executive Order & AI COO/CFO Delegation ticket.
     ExecutiveTicket,
+    /// `MSG`: Instant Bloomberg / Corporate Wire & Smart Attachments (`F7`).
+    CorporateWire,
 }
 
 impl TerminalMnemonic {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::MarketMonitor,
         Self::GraphPrice,
         Self::OrderBook,
         Self::FinancialAnalysis,
         Self::OperationsDag,
         Self::ExecutiveTicket,
+        Self::CorporateWire,
     ];
 
     #[inline]
@@ -34,6 +37,7 @@ impl TerminalMnemonic {
             Self::FinancialAnalysis => "FA",
             Self::OperationsDag => "OPS",
             Self::ExecutiveTicket => "EX",
+            Self::CorporateWire => "MSG",
         }
     }
 }
@@ -41,12 +45,12 @@ impl TerminalMnemonic {
 /// Parsed Bloomberg command from the top command bar (`<TICKER> [MARKET] <MNEMONIC>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTerminalCommand {
-    /// Canonical instrument or corporation ticker (e.g. `"IRON CMDTY"`, `"IRON EQ"`, `"ACME EQ"`, `"PLYR"`).
+    /// Canonical instrument or corporation ticker (e.g. `"IRON CMDTY"`, `"IRON EQ"`, `"GOOGL-DR EQ"`, `"PLEX SC"`, `"PLYR"`).
     pub ticker: String,
     pub mnemonic: TerminalMnemonic,
 }
 
-/// Parses a Bloomberg command string such as `"IRON CMDTY GP"`, `"ACME EQ FA"`, `"PLYR OB"`, or `"APEX OPS"`.
+/// Parses a Bloomberg command string such as `"IRON CMDTY GP"`, `"GOOGL-DR EQ OB"`, `"PLEX SC OB"`, `"PLYR MSG"`, or `"APEX OPS"`.
 pub fn parse_bloomberg_command(input: &str) -> Option<ParsedTerminalCommand> {
     let tokens: Vec<String> = input
         .split_whitespace()
@@ -66,16 +70,34 @@ pub fn parse_bloomberg_command(input: &str) -> Option<ParsedTerminalCommand> {
         "FA" | "FIN" | "BS" => TerminalMnemonic::FinancialAnalysis,
         "OPS" | "DAG" | "SCM" => TerminalMnemonic::OperationsDag,
         "EX" | "TRD" | "ORD" => TerminalMnemonic::ExecutiveTicket,
+        "MSG" | "WIRE" | "IB" => TerminalMnemonic::CorporateWire,
         _ if tokens.len() == 1 => TerminalMnemonic::FinancialAnalysis,
         _ => return None,
     };
 
-    // Preserve explicit market sector qualification (`CMDTY` vs `EQ`) so `IRON CMDTY OB` and `IRON EQ OB`
-    // route to the exact commodity or corporate equity order book!
+    // Preserve explicit market sector qualification (`CMDTY`, `EQ`, `SC`) so `IRON CMDTY OB`, `IRON EQ OB`,
+    // `GOOGL-DR EQ OB`, and `PLEX SC OB` route to the exact order book!
     let ticker = match tokens.get(1).map(String::as_str) {
         Some("CMDTY" | "COMMODITY") => format!("{first} CMDTY"),
+        Some("SC" | "CREDIT") => format!("{first} SC"),
         Some("EQ" | "EQUITY")
             if matches!(
+                mnemonic,
+                TerminalMnemonic::GraphPrice | TerminalMnemonic::OrderBook
+            ) =>
+        {
+            format!("{first} EQ")
+        }
+        _ if first == "PLEX"
+            && matches!(
+                mnemonic,
+                TerminalMnemonic::GraphPrice | TerminalMnemonic::OrderBook
+            ) =>
+        {
+            "PLEX SC".to_owned()
+        }
+        _ if first.ends_with("-DR")
+            && matches!(
                 mnemonic,
                 TerminalMnemonic::GraphPrice | TerminalMnemonic::OrderBook
             ) =>
@@ -89,8 +111,6 @@ pub fn parse_bloomberg_command(input: &str) -> Option<ParsedTerminalCommand> {
             )
             && tokens.len() == 2 =>
         {
-            // When user types `IRON OB` without sector qualifier, default to `IRON EQ` if they specify `EQ`
-            // or `IRON EQ` for equity / `IRON CMDTY` when qualified
             "IRON EQ".to_owned()
         }
         _ => first,

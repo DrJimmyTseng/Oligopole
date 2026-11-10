@@ -359,14 +359,14 @@ impl OligopoleStore {
             return Err(StoreError::MissingSnapshot);
         }
 
-        // Group outbox commands by tick
+        // Group outbox commands by tick, preserving `(seq_no, PlayerCommand)` for dual-clock RNG determinism
         let all_entries = self.load_all_outbox_entries()?;
-        let mut commands_by_tick: BTreeMap<u64, Vec<PlayerCommand>> = BTreeMap::new();
+        let mut commands_by_tick: BTreeMap<u64, Vec<(u32, PlayerCommand)>> = BTreeMap::new();
         for entry in all_entries {
             commands_by_tick
                 .entry(entry.tick)
                 .or_default()
-                .push(entry.command);
+                .push((entry.seq_no, entry.command));
         }
 
         let mut verified_count = 0usize;
@@ -386,7 +386,7 @@ impl OligopoleStore {
             let cmds = commands_by_tick
                 .remove(&target_tick)
                 .unwrap_or_default();
-            replay_world.step_fast_tick(&cmds)?;
+            replay_world.step_fast_tick_sequenced(&cmds)?;
 
             if let Some(expected_hash) = snapshot_hashes.get(&target_tick) {
                 let actual_hash = compute_world_blake3_hash(&replay_world)?;

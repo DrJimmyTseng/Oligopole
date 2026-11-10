@@ -156,6 +156,11 @@ impl LedgerEngine {
         self.entity_balance(entity_id, StandardAccountCode::CashAndDeposits)
     }
 
+    /// Returns total unbanked/tainted cash (`IllicitCash`) owned by `entity_id`.
+    pub fn illicit_cash_balance(&self, entity_id: EntityId) -> Result<Money, LedgerError> {
+        self.entity_balance(entity_id, StandardAccountCode::IllicitCash)
+    }
+
     /// Returns cash currently locked in open CLOB Bid orders for `entity_id`.
     pub fn reserved_cash(&self, entity_id: EntityId) -> Result<Money, LedgerError> {
         Ok(self.entity(entity_id)?.reserved_cash)
@@ -432,18 +437,94 @@ impl LedgerEngine {
                 total_bank_deposit_liabilities =
                     total_bank_deposit_liabilities.checked_add(dep_liab)?;
             } else {
-                total_non_bank_cash = total_non_bank_cash.checked_add(cash)?;
+                let illicit = self.illicit_cash_balance(eid)?;
+                total_non_bank_cash = total_non_bank_cash
+                    .checked_add(cash)?
+                    .checked_add(illicit)?;
             }
         }
 
         if total_non_bank_cash != total_bank_deposit_liabilities {
             return Err(LedgerError::TrialBalanceViolation {
                 reason: format!(
-                    "M1 deposit conservation mismatch: non-bank CashAndDeposits ({total_non_bank_cash}) != bank CustomerDepositsLiability ({total_bank_deposit_liabilities})"
+                    "M1 deposit conservation mismatch: non-bank (CashAndDeposits + IllicitCash) ({total_non_bank_cash}) != bank CustomerDepositsLiability ({total_bank_deposit_liabilities})"
                 ),
             });
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::bank::CommercialBankFacility;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_dual_cash_m1_conservation_across_extortion_and_laundering(
+            endowment_cents in 100_000i128..10_000_000i128,
+            extort_cents in 1_000i128..50_000i128,
+            launder_bps in 1_000u64..9_000u64,
+        ) {
+            let mut ledger = LedgerEngine::new();
+            let bank_id = ledger.register_entity("Central & Commercial Bank", true);
+            let bank = CommercialBankFacility::new(bank_id, 600, 200);
+            let victim_id = ledger.register_entity("Victim Retailer", false);
+            let syndicate_id = ledger.register_entity("Syndicate Front", false);
+            let sovereign_id = ledger.register_entity("Sovereign Treasury", false);
+
+            let endowment = Money::from_cents(endowment_cents);
+            bank.seed_initial_deposit_endowment(&mut ledger, 0, victim_id, endowment).unwrap();
+            ledger.audit_trial_balance().unwrap();
+
+            // 1. Syndicate extorts `extort` from Victim's CleanDeposit into Syndicate's IllicitCash
+            let extort = Money::from_cents(extort_cents);
+            let v_exp = ledger.entity_account_id(victim_id, StandardAccountCode::TaxAndFineExpense).unwrap();
+            let v_cash = ledger.entity_account_id(victim_id, StandardAccountCode::CashAndDeposits).unwrap();
+            let s_illicit = ledger.entity_account_id(syndicate_id, StandardAccountCode::IllicitCash).unwrap();
+            let s_rev = ledger.entity_account_id(syndicate_id, StandardAccountCode::SalesRevenue).unwrap();
+
+            let extort_entry = JournalEntry::new(1, "Protection Racket Extortion")
+                .debit(v_exp, extort)
+                .credit(v_cash, extort)
+                .debit(s_illicit, extort)
+                .credit(s_rev, extort);
+            ledger.post_entry(&extort_entry).unwrap();
+            ledger.audit_trial_balance().unwrap();
+
+            // 2. Syndicate launders a fraction of IllicitCash into CleanDeposit with 5% placement tax to Sovereign
+            let (to_launder, _) = extort.mul_div_rem_u64(launder_bps, 10_000).unwrap();
+            if to_launder.is_positive() {
+                let (tax, _) = to_launder.mul_div_rem_u64(500, 10_000).unwrap();
+                let clean_net = to_launder.checked_sub(tax).unwrap();
+
+                let s_clean = ledger.entity_account_id(syndicate_id, StandardAccountCode::CashAndDeposits).unwrap();
+                let s_tax_exp = ledger.entity_account_id(syndicate_id, StandardAccountCode::TaxAndFineExpense).unwrap();
+                let sov_cash = ledger.entity_account_id(sovereign_id, StandardAccountCode::CashAndDeposits).unwrap();
+                let sov_rev = ledger.entity_account_id(sovereign_id, StandardAccountCode::TaxAndFeeRevenue).unwrap();
+
+                let mut launder_entry = JournalEntry::new(2, "Retail Placement Laundering")
+                    .credit(s_illicit, to_launder);
+                if clean_net.is_positive() {
+                    launder_entry = launder_entry.debit(s_clean, clean_net);
+                }
+                if tax.is_positive() {
+                    launder_entry = launder_entry
+                        .debit(s_tax_exp, tax)
+                        .debit(sov_cash, tax)
+                        .credit(sov_rev, tax);
+                }
+                ledger.post_entry(&launder_entry).unwrap();
+                ledger.audit_trial_balance().unwrap();
+            }
+
+            // Total M1 (Bank CustomerDepositsLiability) remains strictly equal to initial endowment
+            let bank_dep = ledger.entity_balance(bank_id, StandardAccountCode::CustomerDepositsLiability).unwrap();
+            prop_assert_eq!(bank_dep, endowment);
+        }
     }
 }

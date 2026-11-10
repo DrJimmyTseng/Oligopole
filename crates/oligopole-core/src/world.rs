@@ -5,17 +5,28 @@ use crate::clob::{CentralLimitOrderBook, InstrumentKind, LimitOrder, OrderSide, 
 use crate::command::{JointCapitalAction, PlayerCommand, StrategicDirective};
 use crate::error::CoreError;
 use crate::household::{HouseholdCohort, HouseholdCohortKind, RetailStoreOffer};
-use crate::ids::{CohortId, ContractId, CorpId, InstrumentId, OrderId, SkuId};
-use crate::production::{Corporation, CorporationRole, SkuDefinition};
+use crate::ids::{
+    CohortId, ContractId, CorpId, InstrumentId, OrderId, ShortLoanId, SkuId, WireMessageId,
+};
+use crate::production::{
+    AiDelegationConfig, CloudTier, Corporation, CorporationRole, ExecutivePersonaKind,
+    SkuDefinition,
+};
 use crate::retail_market::compute_retail_clearing_plan;
 use crate::snapshot::{CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, WorldView};
+use crate::wire::{
+    CrimeOperationKind, MAX_RESOLVED_WIRE_MESSAGES_PER_CORP, ServiceCreditPosition,
+    ShortPositionRecord, WireAttachment, WireAttachmentStatus, WireMessage,
+};
 use oligopole_ledger::{
     BPS_DENOMINATOR, CommercialBankFacility, EntityId, FinancialStatementReport, JournalEntry,
-    LedgerEngine, LedgerError, Money, StandardAccountCode, allocate_hamilton,
+    LedgerEngine, LedgerError, Money, RoundingReserve, StandardAccountCode, allocate_hamilton,
 };
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use slotmap::SlotMap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Per-shareholder position in a corporation's common stock, tracking open Equity CLOB Ask reservations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -39,8 +50,12 @@ pub struct WorldState {
     pub occ_version: u64,
     pub next_order_seq: u64,
     pub next_contract_seq: u64,
+    pub next_wire_seq: u64,
+    pub next_short_loan_seq: u64,
     pub ledger: LedgerEngine,
     pub bank: CommercialBankFacility,
+    pub sovereign_entity_id: EntityId,
+    pub sovereign_dr_reserve_buffer: Money,
     pub skus: SlotMap<SkuId, SkuDefinition>,
     pub corporations: SlotMap<CorpId, Corporation>,
     pub cohorts: SlotMap<CohortId, HouseholdCohort>,
@@ -48,6 +63,24 @@ pub struct WorldState {
     pub b2b_contracts: Vec<B2BSupplyContract>,
     /// Keyed by `(CorpId, Shareholder EntityId)` for canonical iteration and dividend splits.
     pub equity_positions: BTreeMap<(CorpId, EntityId), EquityHoldingRecord>,
+    /// Keyed by `(InstrumentId, Holder EntityId)` for Global Depositary Receipt holdings.
+    pub depositary_positions: BTreeMap<(InstrumentId, EntityId), EquityHoldingRecord>,
+    /// Total Depositary Receipt units issued per `InstrumentId`.
+    pub depositary_total_units: BTreeMap<InstrumentId, u64>,
+    /// Per-entity `ServiceCredit` (`PLEX` equivalent) balances and reservations.
+    pub service_credit_positions: BTreeMap<EntityId, ServiceCreditPosition>,
+    /// Total `ServiceCredit` units in circulation (`sum(owned_credits)`).
+    pub total_service_credits_supply: u64,
+    /// Idempotent payment webhook reference registry (Guard #5).
+    pub processed_webhook_refs: BTreeSet<String>,
+    /// Active physical share-borrow short positions (Guard #2).
+    pub short_positions: BTreeMap<ShortLoanId, ShortPositionRecord>,
+    /// Senior forensic tax liens owed to `SovereignTreasury` (Guard #4).
+    pub tax_liens: BTreeMap<EntityId, Money>,
+    /// Corporate Wire (`MSG`) inbox/outbox messages and smart attachments (Guard #6).
+    pub wire_messages: Vec<WireMessage>,
+    /// Active corporate espionage wiretaps `(Attacker CorpId, Target CorpId) -> expires_at_tick`.
+    pub active_wiretaps: BTreeMap<(CorpId, CorpId), u64>,
 }
 
 /// Serializable wrapper for `EquityPosition`.
@@ -57,6 +90,8 @@ impl WorldState {
     pub fn new(world_seed: [u8; 32], loan_rate_bps: u32, deposit_rate_bps: u32) -> Self {
         let mut ledger = LedgerEngine::new();
         let bank_id = ledger.register_entity("Central & Commercial Bank", true);
+        let sovereign_entity_id =
+            ledger.register_entity("Sovereign Treasury & Depositary", false);
         let bank = CommercialBankFacility::new(bank_id, loan_rate_bps, deposit_rate_bps);
 
         Self {
@@ -65,14 +100,27 @@ impl WorldState {
             occ_version: 1,
             next_order_seq: 1,
             next_contract_seq: 1,
+            next_wire_seq: 1,
+            next_short_loan_seq: 1,
             ledger,
             bank,
+            sovereign_entity_id,
+            sovereign_dr_reserve_buffer: Money::from_dollars(500_000),
             skus: SlotMap::with_key(),
             corporations: SlotMap::with_key(),
             cohorts: SlotMap::with_key(),
             order_books: SlotMap::with_key(),
             b2b_contracts: Vec::new(),
             equity_positions: BTreeMap::new(),
+            depositary_positions: BTreeMap::new(),
+            depositary_total_units: BTreeMap::new(),
+            service_credit_positions: BTreeMap::new(),
+            total_service_credits_supply: 0,
+            processed_webhook_refs: BTreeSet::new(),
+            short_positions: BTreeMap::new(),
+            tax_liens: BTreeMap::new(),
+            wire_messages: Vec::new(),
+            active_wiretaps: BTreeMap::new(),
         }
     }
 
@@ -83,8 +131,28 @@ impl WorldState {
             .map(|(id, _)| id)
     }
 
-    /// Executes a single `PlayerCommand` (or Slow-Tick `StrategicDirective`) deterministically.
+    /// Derives a deterministic `ChaCha8Rng` seeded from `(world_seed, current_tick, seq_no)` (Guard #5).
+    pub fn seeded_command_rng(&self, seq_no: u32) -> ChaCha8Rng {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.world_seed);
+        hasher.update(&self.current_tick.0.to_le_bytes());
+        hasher.update(&seq_no.to_le_bytes());
+        let digest = hasher.finalize();
+        ChaCha8Rng::from_seed(*digest.as_bytes())
+    }
+
+    /// Executes a single `PlayerCommand` at `seq_no = 0`.
     pub fn execute_command(&mut self, cmd: PlayerCommand) -> Result<(), CoreError> {
+        self.execute_command_sequenced(cmd, 0)
+    }
+
+    /// Executes a single `PlayerCommand` (or Slow-Tick `StrategicDirective`) deterministically
+    /// with explicit intraday `seq_no` for RNG seeding (Guard #5).
+    pub fn execute_command_sequenced(
+        &mut self,
+        cmd: PlayerCommand,
+        seq_no: u32,
+    ) -> Result<(), CoreError> {
         let tick = self.current_tick.0;
         match cmd {
             PlayerCommand::SubmitClobOrder {
@@ -186,6 +254,103 @@ impl WorldState {
             }
             PlayerCommand::ApplyStrategicDirective(directive) => {
                 self.apply_reconciled_directive(directive)?;
+            }
+            PlayerCommand::AuthorityMintServiceCredit {
+                recipient_entity_id,
+                credits,
+                webhook_ref,
+            } => {
+                self.execute_authority_mint_service_credit(
+                    recipient_entity_id,
+                    credits,
+                    webhook_ref,
+                )?;
+            }
+            PlayerCommand::IngestOraclePriceTick {
+                instrument_id,
+                new_oracle_price,
+            } => {
+                self.execute_ingest_oracle_price_tick(instrument_id, new_oracle_price)?;
+            }
+            PlayerCommand::FoundPrivateSme {
+                founder_entity_id,
+                ticker,
+                name,
+                role,
+                seed_capital,
+            } => {
+                self.execute_found_private_sme(
+                    founder_entity_id,
+                    &ticker,
+                    &name,
+                    role,
+                    seed_capital,
+                )?;
+            }
+            PlayerCommand::LaunchIpoAuction {
+                corp_id,
+                primary_shares_to_issue,
+                offer_price,
+            } => {
+                self.execute_launch_ipo_auction(corp_id, primary_shares_to_issue, offer_price)?;
+            }
+            PlayerCommand::BorrowSharesToShort {
+                borrower_entity_id,
+                corp_id,
+                shares,
+                sell_limit_price,
+            } => {
+                self.execute_borrow_shares_to_short(
+                    borrower_entity_id,
+                    corp_id,
+                    shares,
+                    sell_limit_price,
+                )?;
+            }
+            PlayerCommand::CoverShortPosition {
+                short_loan_id,
+                max_buy_price,
+            } => {
+                self.execute_cover_short_position(short_loan_id, max_buy_price)?;
+            }
+            PlayerCommand::ExecuteCrimeOperation {
+                actor_corp_id,
+                target_corp_id,
+                kind,
+            } => {
+                self.execute_crime_operation(actor_corp_id, target_corp_id, kind, seq_no)?;
+            }
+            PlayerCommand::LaunderIllicitCash { corp_id, amount } => {
+                self.execute_launder_illicit_cash(corp_id, amount, seq_no)?;
+            }
+            PlayerCommand::SetCloudSubscriptionTier { corp_id, tier } => {
+                let corp = self
+                    .corporations
+                    .get_mut(corp_id)
+                    .ok_or(CoreError::UnknownCorporation(corp_id))?;
+                corp.subscribed_cloud_tier = tier;
+            }
+            PlayerCommand::SendWireMessage {
+                sender_corp_id,
+                recipient_corp_id,
+                subject,
+                body,
+                attachment,
+            } => {
+                self.execute_send_wire_message(
+                    sender_corp_id,
+                    recipient_corp_id,
+                    subject,
+                    body,
+                    attachment,
+                )?;
+            }
+            PlayerCommand::RespondWireAttachment {
+                responder_corp_id,
+                message_id,
+                accept,
+            } => {
+                self.execute_respond_wire_attachment(responder_corp_id, message_id, accept)?;
             }
         }
         Ok(())
@@ -331,6 +496,8 @@ impl WorldState {
                     .skus
                     .get(retail_sku)
                     .map_or(Money::from_dollars(220), |s| s.base_reference_price),
+                CorporationRole::LogisticsTrucking { .. } => Money::from_dollars(15),
+                CorporationRole::PrivateSecurity { .. } => Money::from_dollars(2_500),
             });
 
         if let Some(corp) = self.corporations.get_mut(corp_id) {
@@ -521,14 +688,18 @@ impl WorldState {
         }
         let spendable = avail_cash.checked_sub(working_floor)?;
         let budget = buyback_budget.min(spendable);
-        let qty_i128 = budget.checked_div_euclid(max_limit_price.cents())?.cents();
+        let safe_px = self
+            .order_books
+            .get(eq_inst_id)
+            .map_or(max_limit_price, |b| b.clamp_luld_price(max_limit_price));
+        let qty_i128 = budget.checked_div_euclid(safe_px.cents())?.cents();
         let qty = u64::try_from(qty_i128).unwrap_or(0);
         if qty > 0 {
             let (order_id, _) = self.submit_clob_limit_order(
                 entity_id,
                 eq_inst_id,
                 OrderSide::Bid,
-                max_limit_price,
+                safe_px,
                 qty,
             )?;
             // Immediate-or-Cancel (IOC) execution for corporate buybacks so operating cash is never locked indefinitely
@@ -564,6 +735,10 @@ impl WorldState {
         };
 
         self.cancel_all_orders_for_entity_on_book(eq_inst_id, entity_id)?;
+        let safe_px = self
+            .order_books
+            .get(eq_inst_id)
+            .map_or(min_ask_price, |b| b.clamp_luld_price(min_ask_price));
         if let Some(corp) = self.corporations.get_mut(corp_id) {
             corp.total_shares_outstanding = corp
                 .total_shares_outstanding
@@ -580,15 +755,16 @@ impl WorldState {
                 entity_id,
                 eq_inst_id,
                 OrderSide::Ask,
-                min_ask_price,
+                safe_px,
                 total_treasury,
             )?;
         }
         Ok(())
     }
 
-    /// Reserves collateral (`reserved_cash`, `reserved_qty`, or `reserved_shares`), submits a limit order
-    /// to `instrument_id`, and immediately settles any matched `TradeFill`s.
+    /// Reserves collateral (`reserved_cash`, `reserved_qty`, `reserved_shares`, or `reserved_credits`),
+    /// validates LULD $\pm 10\%$ circuit-breaker bounds, submits a limit order to `instrument_id`,
+    /// and immediately settles any matched `TradeFill`s (including the `10 bps` Sovereign rake).
     pub fn submit_clob_limit_order(
         &mut self,
         trader_entity_id: EntityId,
@@ -603,11 +779,14 @@ impl WorldState {
             });
         }
 
-        let kind = self
-            .order_books
-            .get(instrument_id)
-            .ok_or(CoreError::UnknownInstrument(instrument_id))?
-            .kind;
+        let kind = {
+            let book = self
+                .order_books
+                .get(instrument_id)
+                .ok_or(CoreError::UnknownInstrument(instrument_id))?;
+            book.validate_luld_price(limit_price)?;
+            book.kind
+        };
 
         // 1. Reserve collateral prior to order insertion
         match side {
@@ -630,11 +809,23 @@ impl WorldState {
                     corp.inventory_lot_mut(sku_id).reserve_units(qty)?;
                 }
                 InstrumentKind::Equity { corp_id } => {
+                    let locked_founder_shares = self
+                        .corporations
+                        .get(corp_id)
+                        .map_or(0, |c| {
+                            if c.founder_entity_id == Some(trader_entity_id)
+                                && self.current_tick.0 < c.founder_lockup_until_tick
+                            {
+                                c.founder_locked_shares
+                            } else {
+                                0
+                            }
+                        });
                     let pos = self
                         .equity_positions
                         .entry((corp_id, trader_entity_id))
                         .or_default();
-                    let avail = pos.available_shares();
+                    let avail = pos.available_shares().saturating_sub(locked_founder_shares);
                     if qty > avail {
                         return Err(CoreError::InsufficientShares {
                             corp_id,
@@ -643,6 +834,36 @@ impl WorldState {
                         });
                     }
                     pos.reserved_shares = pos.reserved_shares.saturating_add(qty);
+                }
+                InstrumentKind::DepositaryReceipt { .. } => {
+                    let pos = self
+                        .depositary_positions
+                        .entry((instrument_id, trader_entity_id))
+                        .or_default();
+                    let avail = pos.available_shares();
+                    if qty > avail {
+                        return Err(CoreError::InvalidOrder {
+                            reason: format!(
+                                "insufficient Depositary Receipt units: available {avail}, requested {qty}"
+                            ),
+                        });
+                    }
+                    pos.reserved_shares = pos.reserved_shares.saturating_add(qty);
+                }
+                InstrumentKind::ServiceCredit => {
+                    let pos = self
+                        .service_credit_positions
+                        .entry(trader_entity_id)
+                        .or_default();
+                    let avail = pos.available_credits();
+                    if qty > avail {
+                        return Err(CoreError::InvalidOrder {
+                            reason: format!(
+                                "insufficient ServiceCredits: available {avail}, requested {qty}"
+                            ),
+                        });
+                    }
+                    pos.reserved_credits = pos.reserved_credits.saturating_add(qty);
                 }
             },
         }
@@ -743,6 +964,22 @@ impl WorldState {
                             pos.reserved_shares.saturating_sub(order.remaining_qty);
                     }
                 }
+                InstrumentKind::DepositaryReceipt { .. } => {
+                    if let Some(pos) = self
+                        .depositary_positions
+                        .get_mut(&(order.instrument_id, order.trader_entity_id))
+                    {
+                        pos.reserved_shares =
+                            pos.reserved_shares.saturating_sub(order.remaining_qty);
+                    }
+                }
+                InstrumentKind::ServiceCredit => {
+                    if let Some(pos) = self.service_credit_positions.get_mut(&order.trader_entity_id)
+                    {
+                        pos.reserved_credits =
+                            pos.reserved_credits.saturating_sub(order.remaining_qty);
+                    }
+                }
             },
         }
         Ok(())
@@ -755,6 +992,16 @@ impl WorldState {
             .release_reserved_cash(fill.buyer_entity_id, reserved_cash_to_release)?;
 
         let trade_notional = fill.execution_price.checked_mul_u64(fill.qty)?;
+        // 10 bps Sovereign Monopoly Toll Gate rake on non-sovereign trades
+        let sovereign_rake = if fill.buyer_entity_id == self.sovereign_entity_id
+            || fill.seller_entity_id == self.sovereign_entity_id
+        {
+            Money::ZERO
+        } else {
+            let (rake, _) = trade_notional.mul_div_rem_u64(10, BPS_DENOMINATOR)?;
+            rake
+        };
+        let seller_net_cash = trade_notional.checked_sub(sovereign_rake)?;
 
         match kind {
             InstrumentKind::Commodity { sku_id } => {
@@ -817,8 +1064,29 @@ impl WorldState {
                 let mut entry = JournalEntry::new(tick, "Commodity CLOB Fill Settlement")
                     .debit(buyer_inv, trade_notional)
                     .credit(buyer_cash, trade_notional)
-                    .debit(seller_cash, trade_notional)
                     .credit(seller_rev, trade_notional);
+
+                if seller_net_cash.is_positive() {
+                    entry = entry.debit(seller_cash, seller_net_cash);
+                }
+                if sovereign_rake.is_positive() {
+                    let seller_tax = self.ledger.entity_account_id(
+                        fill.seller_entity_id,
+                        StandardAccountCode::TaxAndFineExpense,
+                    )?;
+                    let sov_cash = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::CashAndDeposits,
+                    )?;
+                    let sov_rev = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::TaxAndFeeRevenue,
+                    )?;
+                    entry = entry
+                        .debit(seller_tax, sovereign_rake)
+                        .debit(sov_cash, sovereign_rake)
+                        .credit(sov_rev, sovereign_rake);
+                }
 
                 if seller_cogs.is_positive() {
                     entry = entry
@@ -830,7 +1098,6 @@ impl WorldState {
             }
             InstrumentKind::Equity { corp_id } => {
                 // Secondary market equity transfer (or corporate share buyback / primary issuance):
-                // Seller transfers `fill.qty` reserved shares to Buyer; Buyer transfers `trade_notional` cash to Seller.
                 let issuer_entity_id = self
                     .corporations
                     .get(corp_id)
@@ -880,11 +1147,155 @@ impl WorldState {
                     .ledger
                     .entity_account_id(fill.seller_entity_id, StandardAccountCode::CommonStock)?;
 
-                let entry = JournalEntry::new(tick, "Secondary Equity CLOB Trade Settlement")
+                let mut entry = JournalEntry::new(tick, "Secondary Equity CLOB Trade Settlement")
                     .debit(buyer_eq, trade_notional)
                     .credit(buyer_cash, trade_notional)
-                    .debit(seller_cash, trade_notional)
                     .credit(seller_eq, trade_notional);
+
+                if seller_net_cash.is_positive() {
+                    entry = entry.debit(seller_cash, seller_net_cash);
+                }
+                if sovereign_rake.is_positive() {
+                    let seller_tax = self.ledger.entity_account_id(
+                        fill.seller_entity_id,
+                        StandardAccountCode::TaxAndFineExpense,
+                    )?;
+                    let sov_cash = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::CashAndDeposits,
+                    )?;
+                    let sov_rev = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::TaxAndFeeRevenue,
+                    )?;
+                    entry = entry
+                        .debit(seller_tax, sovereign_rake)
+                        .debit(sov_cash, sovereign_rake)
+                        .credit(sov_rev, sovereign_rake);
+                }
+                self.ledger.post_entry(&entry)?;
+            }
+            InstrumentKind::DepositaryReceipt { .. } => {
+                let seller_pos = self
+                    .depositary_positions
+                    .entry((fill.instrument_id, fill.seller_entity_id))
+                    .or_default();
+                if fill.qty > seller_pos.reserved_shares || fill.qty > seller_pos.owned_shares {
+                    return Err(CoreError::InvalidOrder {
+                        reason: "insufficient reserved Depositary Receipt units on fill".to_owned(),
+                    });
+                }
+                seller_pos.reserved_shares -= fill.qty;
+                seller_pos.owned_shares -= fill.qty;
+
+                let buyer_pos = self
+                    .depositary_positions
+                    .entry((fill.instrument_id, fill.buyer_entity_id))
+                    .or_default();
+                buyer_pos.owned_shares = buyer_pos.owned_shares.saturating_add(fill.qty);
+
+                let buyer_eq = self
+                    .ledger
+                    .entity_account_id(fill.buyer_entity_id, StandardAccountCode::CommonStock)?;
+                let buyer_cash = self
+                    .ledger
+                    .entity_account_id(fill.buyer_entity_id, StandardAccountCode::CashAndDeposits)?;
+                let seller_cash = self.ledger.entity_account_id(
+                    fill.seller_entity_id,
+                    StandardAccountCode::CashAndDeposits,
+                )?;
+                let seller_eq = self
+                    .ledger
+                    .entity_account_id(fill.seller_entity_id, StandardAccountCode::CommonStock)?;
+
+                let mut entry =
+                    JournalEntry::new(tick, "Global Depositary Receipt CLOB Trade Settlement")
+                        .debit(buyer_eq, trade_notional)
+                        .credit(buyer_cash, trade_notional)
+                        .credit(seller_eq, trade_notional);
+
+                if seller_net_cash.is_positive() {
+                    entry = entry.debit(seller_cash, seller_net_cash);
+                }
+                if sovereign_rake.is_positive() {
+                    let seller_tax = self.ledger.entity_account_id(
+                        fill.seller_entity_id,
+                        StandardAccountCode::TaxAndFineExpense,
+                    )?;
+                    let sov_cash = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::CashAndDeposits,
+                    )?;
+                    let sov_rev = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::TaxAndFeeRevenue,
+                    )?;
+                    entry = entry
+                        .debit(seller_tax, sovereign_rake)
+                        .debit(sov_cash, sovereign_rake)
+                        .credit(sov_rev, sovereign_rake);
+                }
+                self.ledger.post_entry(&entry)?;
+            }
+            InstrumentKind::ServiceCredit => {
+                let seller_pos = self
+                    .service_credit_positions
+                    .entry(fill.seller_entity_id)
+                    .or_default();
+                if fill.qty > seller_pos.reserved_credits || fill.qty > seller_pos.owned_credits {
+                    return Err(CoreError::InvalidOrder {
+                        reason: "insufficient reserved ServiceCredits on fill".to_owned(),
+                    });
+                }
+                seller_pos.reserved_credits -= fill.qty;
+                seller_pos.owned_credits -= fill.qty;
+
+                let buyer_pos = self
+                    .service_credit_positions
+                    .entry(fill.buyer_entity_id)
+                    .or_default();
+                buyer_pos.owned_credits = buyer_pos.owned_credits.saturating_add(fill.qty);
+
+                let buyer_eq = self
+                    .ledger
+                    .entity_account_id(fill.buyer_entity_id, StandardAccountCode::CommonStock)?;
+                let buyer_cash = self
+                    .ledger
+                    .entity_account_id(fill.buyer_entity_id, StandardAccountCode::CashAndDeposits)?;
+                let seller_cash = self.ledger.entity_account_id(
+                    fill.seller_entity_id,
+                    StandardAccountCode::CashAndDeposits,
+                )?;
+                let seller_eq = self
+                    .ledger
+                    .entity_account_id(fill.seller_entity_id, StandardAccountCode::CommonStock)?;
+
+                let mut entry = JournalEntry::new(tick, "ServiceCredit (PLEX) CLOB Trade Settlement")
+                    .debit(buyer_eq, trade_notional)
+                    .credit(buyer_cash, trade_notional)
+                    .credit(seller_eq, trade_notional);
+
+                if seller_net_cash.is_positive() {
+                    entry = entry.debit(seller_cash, seller_net_cash);
+                }
+                if sovereign_rake.is_positive() {
+                    let seller_tax = self.ledger.entity_account_id(
+                        fill.seller_entity_id,
+                        StandardAccountCode::TaxAndFineExpense,
+                    )?;
+                    let sov_cash = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::CashAndDeposits,
+                    )?;
+                    let sov_rev = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::TaxAndFeeRevenue,
+                    )?;
+                    entry = entry
+                        .debit(seller_tax, sovereign_rake)
+                        .debit(sov_cash, sovereign_rake)
+                        .credit(sov_rev, sovereign_rake);
+                }
                 self.ledger.post_entry(&entry)?;
             }
         }
@@ -895,6 +1306,19 @@ impl WorldState {
     /// Advances the world by 1 Fast Tick (1 simulated 30/360 day), executing all 5 intraday sub-phases
     /// and asserting global double-entry trial balance and WAC inventory book-value conservation.
     pub fn step_fast_tick(&mut self, pending_commands: &[PlayerCommand]) -> Result<(), CoreError> {
+        let sequenced: Vec<(u32, PlayerCommand)> = pending_commands
+            .iter()
+            .enumerate()
+            .map(|(idx, cmd)| (u32::try_from(idx).unwrap_or(0), cmd.clone()))
+            .collect();
+        self.step_fast_tick_sequenced(&sequenced)
+    }
+
+    /// Advances the world by 1 Fast Tick (1 simulated 30/360 day) with explicit `(seq_no, PlayerCommand)` pairs.
+    pub fn step_fast_tick_sequenced(
+        &mut self,
+        pending_commands: &[(u32, PlayerCommand)],
+    ) -> Result<(), CoreError> {
         let next_tick = self.current_tick.next();
         self.current_tick = next_tick;
         self.occ_version = self.occ_version.saturating_add(1);
@@ -903,12 +1327,14 @@ impl WorldState {
             for (_, corp) in &mut self.corporations {
                 corp.monthly_units_output = 0;
                 corp.monthly_units_sold = 0;
+                corp.monthly_genuine_b2c_revenue = Money::ZERO;
+                corp.monthly_laundered_cash = Money::ZERO;
             }
         }
 
-        // 0. Drain pending commands at start of day
-        for cmd in pending_commands {
-            self.execute_command(cmd.clone())?;
+        // 0. Drain pending commands at start of day with explicit seq_no
+        for (seq_no, cmd) in pending_commands {
+            self.execute_command_sequenced(cmd.clone(), *seq_no)?;
         }
 
         // Sub-Phase 1: Morning Logistics, B2B Contract Deliveries & Wholesale Replenishment
@@ -917,13 +1343,13 @@ impl WorldState {
         // Sub-Phase 2: Factory DAG Production & Resource Extraction
         self.run_subphase_2_production()?;
 
-        // Sub-Phase 3: Commodity & Equity CLOB Matching & OHLCV Finalization
+        // Sub-Phase 3: Commodity, Equity, DR & ServiceCredit CLOB Matching & OHLCV Finalization
         self.run_subphase_3_clob_matching()?;
 
         // Sub-Phase 4: Household Stone-Geary + Padé (2,2) MNL Retail Purchasing
         self.run_subphase_4_retail_consumption()?;
 
-        // Sub-Phase 5: Payroll, 30/360 Interest Accrual, Dividends, Quarterly Closing & Audit
+        // Sub-Phase 5: Payroll, 30/360 Interest Accrual, Dividends, Sovereign Recycling & Audit
         self.run_subphase_5_settlement_and_audit()?;
 
         Ok(())
@@ -932,7 +1358,18 @@ impl WorldState {
     fn run_subphase_1_b2b_and_wholesale(&mut self) -> Result<(), CoreError> {
         let tick = self.current_tick.0;
 
-        // 1A. Deliver scheduled bilateral B2B contract tranches
+        // 1A. Deliver scheduled bilateral B2B contract tranches & pay logistics freight tariffs
+        let logistics_corps: Vec<(CorpId, EntityId, Money)> = self
+            .corporations
+            .iter()
+            .filter_map(|(cid, c)| match c.role {
+                CorporationRole::LogisticsTrucking { .. } if c.posted_selling_price.is_positive() => {
+                    Some((cid, c.entity_id, c.posted_selling_price))
+                }
+                _ => None,
+            })
+            .collect();
+
         let mut active_contracts = Vec::with_capacity(self.b2b_contracts.len());
         let contracts_snapshot = std::mem::take(&mut self.b2b_contracts);
 
@@ -940,7 +1377,7 @@ impl WorldState {
             if contract.remaining_days == 0 {
                 continue;
             }
-            self.settle_b2b_transfer(
+            let delivered = self.settle_b2b_transfer(
                 tick,
                 contract.supplier_corp_id,
                 contract.buyer_corp_id,
@@ -948,6 +1385,48 @@ impl WorldState {
                 contract.daily_qty,
                 contract.unit_price,
             )?;
+            if delivered > 0 && !logistics_corps.is_empty() {
+                let buyer_entity = self
+                    .corporations
+                    .get(contract.buyer_corp_id)
+                    .map(|c| c.entity_id);
+                if let Some(b_ent) = buyer_entity {
+                    let b_avail = self.ledger.available_cash(b_ent)?;
+                    for &(log_cid, log_ent, unit_tariff) in &logistics_corps {
+                        if log_ent == b_ent {
+                            continue;
+                        }
+                        let fee = unit_tariff.checked_mul_u64(delivered)?;
+                        if fee.is_positive() && b_avail >= fee.checked_mul_u64(4)? {
+                            let b_exp = self.ledger.entity_account_id(
+                                b_ent,
+                                StandardAccountCode::SecurityAndFreightExpense,
+                            )?;
+                            let b_cash = self
+                                .ledger
+                                .entity_account_id(b_ent, StandardAccountCode::CashAndDeposits)?;
+                            let l_cash = self
+                                .ledger
+                                .entity_account_id(log_ent, StandardAccountCode::CashAndDeposits)?;
+                            let l_rev = self
+                                .ledger
+                                .entity_account_id(log_ent, StandardAccountCode::SalesRevenue)?;
+                            let entry =
+                                JournalEntry::new(tick, "B2B Logistics Freight Tariff Settlement")
+                                    .debit(b_exp, fee)
+                                    .credit(b_cash, fee)
+                                    .debit(l_cash, fee)
+                                    .credit(l_rev, fee);
+                            self.ledger.post_entry(&entry)?;
+                            if let Some(lc) = self.corporations.get_mut(log_cid) {
+                                lc.monthly_units_sold =
+                                    lc.monthly_units_sold.saturating_add(delivered);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             contract.remaining_days -= 1;
             if contract.remaining_days > 0 {
                 active_contracts.push(contract);
@@ -1141,7 +1620,7 @@ impl WorldState {
         let corp_ids: Vec<CorpId> = self.corporations.keys().collect();
 
         for corp_id in corp_ids {
-            let (entity_id, role, daily_capacity, daily_wage_bill) = {
+            let (entity_id, role, raw_capacity, daily_wage_bill, degraded_until) = {
                 let Some(corp) = self.corporations.get(corp_id) else {
                     continue;
                 };
@@ -1150,7 +1629,13 @@ impl WorldState {
                     corp.role,
                     corp.daily_capacity,
                     corp.daily_wage_bill,
+                    corp.ransomware_degraded_until_tick,
                 )
+            };
+            let daily_capacity = if degraded_until > tick {
+                ((raw_capacity.saturating_mul(60)) / 100).max(1)
+            } else {
+                raw_capacity
             };
 
             match role {
@@ -1286,7 +1771,9 @@ impl WorldState {
                         self.ledger.post_entry(&entry)?;
                     }
                 }
-                CorporationRole::Retailer { .. } => {}
+                CorporationRole::Retailer { .. }
+                | CorporationRole::LogisticsTrucking { .. }
+                | CorporationRole::PrivateSecurity { .. } => {}
             }
         }
 
@@ -1299,7 +1786,9 @@ impl WorldState {
             .iter()
             .filter_map(|(inst_id, book)| match book.kind {
                 InstrumentKind::Commodity { sku_id } => Some((inst_id, sku_id)),
-                InstrumentKind::Equity { .. } => None,
+                InstrumentKind::Equity { .. }
+                | InstrumentKind::DepositaryReceipt { .. }
+                | InstrumentKind::ServiceCredit => None,
             })
             .collect();
 
@@ -1327,12 +1816,16 @@ impl WorldState {
                             .corporations
                             .get(corp_id)
                             .map_or(0, |c| c.inventory_lot(book_sku).available_qty());
-                        if fresh_avail > 0 && ask_price.is_positive() {
+                        let safe_ask = self
+                            .order_books
+                            .get(inst_id)
+                            .map_or(ask_price, |b| b.clamp_luld_price(ask_price));
+                        if fresh_avail > 0 && safe_ask.is_positive() {
                             self.submit_clob_limit_order(
                                 entity_id,
                                 inst_id,
                                 OrderSide::Ask,
-                                ask_price,
+                                safe_ask,
                                 fresh_avail,
                             )?;
                         }
@@ -1363,6 +1856,10 @@ impl WorldState {
                 {
                     if input_sku == book_sku && auto_procure && bid_price.is_positive() {
                         self.cancel_all_orders_for_entity_on_book(inst_id, entity_id)?;
+                        let safe_bid = self
+                            .order_books
+                            .get(inst_id)
+                            .map_or(bid_price, |b| b.clamp_luld_price(bid_price));
                         let current_qty = self
                             .corporations
                             .get(corp_id)
@@ -1393,7 +1890,7 @@ impl WorldState {
                             };
                             let bid_budget = Money::from_cents(free_cash.cents() / 2);
                             let affordable_i128 =
-                                bid_budget.checked_div_euclid(bid_price.cents())?.cents();
+                                bid_budget.checked_div_euclid(safe_bid.cents())?.cents();
                             let affordable = u64::try_from(affordable_i128).unwrap_or(0);
                             let order_qty = needed.min(affordable);
                             if order_qty > 0 {
@@ -1401,7 +1898,7 @@ impl WorldState {
                                     entity_id,
                                     inst_id,
                                     OrderSide::Bid,
-                                    bid_price,
+                                    safe_bid,
                                     order_qty,
                                 )?;
                             }
@@ -1414,7 +1911,13 @@ impl WorldState {
         // 3. Closed-loop Secondary Equity CLOB Market-Making & Portfolio Rebalancing
         self.run_subphase_3_equity_market_making()?;
 
-        // Finalize daily OHLCV bar across all Commodity & Equity order books
+        // 4. Sovereign Depositary Receipt (`GOOGL-DR`, `META-DR`, `NVDA-DR`) & `ServiceCredit` (`PLEX`) Market-Making
+        self.run_subphase_3_depositary_and_sc_market_making()?;
+
+        // 5. Physical Short-Locate 115% Maintenance Margin Check & Forced Buy-Ins (Guard #2)
+        self.run_subphase_3_short_maintenance_margin()?;
+
+        // Finalize daily OHLCV bar across all order books
         let tick = self.current_tick.0;
         for (_, book) in &mut self.order_books {
             book.finalize_daily_bar(tick);
@@ -1438,19 +1941,20 @@ impl WorldState {
         )?;
 
         let book_value_cents = (report.total_equity_including_net_income.cents() / shares).max(100);
-        // Include physical productive capacity replacement value ($2,500 per daily capacity unit) in intrinsic asset backing
+        // Include physical productive capacity replacement value ($6,500 per daily capacity unit) in intrinsic asset backing
         let capacity_value_cents =
-            (i128::from(corp.daily_capacity) * 250_000) / shares;
-        let intrinsic_asset_cents = book_value_cents.max(capacity_value_cents);
+            (i128::from(corp.daily_capacity) * 650_000) / shares;
+        let intrinsic_asset_cents = book_value_cents.saturating_add(capacity_value_cents);
 
         let quarter_days = i128::from(((self.current_tick.0.saturating_sub(1)) % 90) + 1);
         let annualized_ni_cents = (report.net_income.cents().max(0) * 360) / quarter_days;
-        // 12x P/E multiple on annualized net income per share
-        let earnings_value_cents = (annualized_ni_cents * 12) / shares;
+        // 12x P/E multiple on annualized net income per share (floored at 3.5x intrinsic asset value during ramp-up)
+        let ramp_floor_cents = (intrinsic_asset_cents * 35) / 10;
+        let earnings_value_cents = ((annualized_ni_cents * 12) / shares).max(ramp_floor_cents);
 
         let annualized_div_cents = corp.last_monthly_dividend_paid.cents().max(0) * 12;
-        // 5% target dividend yield -> 20x annualized dividend per share
-        let div_value_cents = (annualized_div_cents * 20) / shares;
+        // 5% target dividend yield -> 20x annualized dividend per share (floored at 3.5x intrinsic asset value prior to first payout)
+        let div_value_cents = ((annualized_div_cents * 20) / shares).max(ramp_floor_cents);
 
         let blended_cents =
             (intrinsic_asset_cents * 40 + earnings_value_cents * 40 + div_value_cents * 20) / 100;
@@ -1480,7 +1984,9 @@ impl WorldState {
             .iter()
             .filter_map(|(inst_id, book)| match book.kind {
                 InstrumentKind::Equity { corp_id } => Some((inst_id, corp_id)),
-                InstrumentKind::Commodity { .. } => None,
+                InstrumentKind::Commodity { .. }
+                | InstrumentKind::DepositaryReceipt { .. }
+                | InstrumentKind::ServiceCredit => None,
             })
             .collect();
 
@@ -1500,11 +2006,25 @@ impl WorldState {
                 .map_or(fair_val, |b| b.last_price);
             // Smooth anchor price: 50% fundamental value + 50% trailing market price
             let anchor_cents = i128::midpoint(fair_val.cents(), last_px.cents()).max(200);
+            if let Some(book) = self.order_books.get_mut(inst_id) {
+                book.luld_reference_price = Money::from_cents(anchor_cents);
+            }
 
-            let bid_l1 = Money::from_cents(((anchor_cents * 98) / 100).max(100));
-            let bid_l2 = Money::from_cents(((anchor_cents * 95) / 100).max(100));
-            let ask_l1 = Money::from_cents(((anchor_cents * 102) / 100).max(bid_l1.cents() + 10));
-            let ask_l2 = Money::from_cents(((anchor_cents * 105) / 100).max(ask_l1.cents() + 10));
+            let raw_bid_l1 = Money::from_cents(((anchor_cents * 98) / 100).max(100));
+            let raw_bid_l2 = Money::from_cents(((anchor_cents * 95) / 100).max(100));
+            let raw_ask_l1 = Money::from_cents(((anchor_cents * 102) / 100).max(raw_bid_l1.cents() + 10));
+            let raw_ask_l2 = Money::from_cents(((anchor_cents * 105) / 100).max(raw_ask_l1.cents() + 10));
+            let (bid_l1, bid_l2, ask_l1, ask_l2) = self.order_books.get(inst_id).map_or(
+                (raw_bid_l1, raw_bid_l2, raw_ask_l1, raw_ask_l2),
+                |b| {
+                    (
+                        b.clamp_luld_price(raw_bid_l1),
+                        b.clamp_luld_price(raw_bid_l2),
+                        b.clamp_luld_price(raw_ask_l1),
+                        b.clamp_luld_price(raw_ask_l2),
+                    )
+                },
+            );
 
             // 1. Capitalists & Executives Cohort posts two-sided market-making depth (Bids + Asks)
             let cap_avail_shares = self
@@ -1575,7 +2095,7 @@ impl WorldState {
             // 2. Managers & Skilled Cohort rebalances equity portfolio against Capitalist quotes
             let idx_u64 = u64::try_from(book_idx).unwrap_or(0);
             let cycle = (tick.wrapping_add(idx_u64 * 5)) % 6;
-            if fair_val >= last_px || cycle < 3 {
+            if fair_val >= last_px || cycle < 4 {
                 // Managers accumulate undervalued / high-yield shares by lifting Asks or posting Bids
                 let mgr_cash = self.ledger.available_cash(mgr_entity)?;
                 let mgr_reserve = mgr_floor.checked_mul_u64(2)?;
@@ -1583,7 +2103,7 @@ impl WorldState {
                     let alloc = Money::from_cents(
                         mgr_cash.checked_sub(mgr_reserve)?.cents() / (num_books * 16),
                     );
-                    let buy_px = if cycle == 0 { ask_l1 } else { bid_l1 };
+                    let buy_px = if cycle < 3 { ask_l1 } else { bid_l1 };
                     let qty = u64::try_from(alloc.checked_div_euclid(buy_px.cents())?.cents())
                         .unwrap_or(0)
                         .min(60);
@@ -1605,7 +2125,7 @@ impl WorldState {
                     .map_or(0, |p| p.available_shares());
                 if mgr_shares >= 100 {
                     let sell_qty = (mgr_shares / 300).clamp(2, 40);
-                    let sell_px = if cycle == 3 { bid_l1 } else { ask_l1 };
+                    let sell_px = ask_l1;
                     self.submit_clob_limit_order(
                         mgr_entity,
                         inst_id,
@@ -1643,6 +2163,130 @@ impl WorldState {
         Ok(())
     }
 
+    fn run_subphase_3_depositary_and_sc_market_making(&mut self) -> Result<(), CoreError> {
+        let sov_id = self.sovereign_entity_id;
+        let dr_books: Vec<InstrumentId> = self
+            .order_books
+            .iter()
+            .filter_map(|(id, b)| match b.kind {
+                InstrumentKind::DepositaryReceipt { .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        for inst_id in dr_books {
+            self.cancel_all_orders_for_entity_on_book(inst_id, sov_id)?;
+            let ref_px = self
+                .order_books
+                .get(inst_id)
+                .map_or(Money::from_dollars(100), |b| b.luld_reference_price);
+            let bid_px = Money::from_cents(((ref_px.cents() * 99) / 100).max(100));
+            let ask_px = Money::from_cents(((ref_px.cents() * 101) / 100).max(bid_px.cents() + 10));
+
+            // Ensure SovereignTreasury has at least $150k liquidity via its endogenous repo line at CommercialBankFacility
+            let avail_cash = self.ledger.available_cash(sov_id)?;
+            let min_buffer = Money::from_dollars(150_000);
+            if avail_cash < min_buffer {
+                let top_up = min_buffer.checked_sub(avail_cash)?;
+                self.bank.originate_loan(
+                    &mut self.ledger,
+                    self.current_tick.0,
+                    sov_id,
+                    top_up,
+                    Some(200),
+                )?;
+            }
+
+            let sov_dr_avail = self
+                .depositary_positions
+                .get(&(inst_id, sov_id))
+                .map_or(0, |p| p.available_shares());
+            if sov_dr_avail >= 50 {
+                let ask_qty = (sov_dr_avail / 100).clamp(10, 200);
+                self.submit_clob_limit_order(sov_id, inst_id, OrderSide::Ask, ask_px, ask_qty)?;
+            }
+
+            let fresh_cash = self.ledger.available_cash(sov_id)?;
+            let bid_budget = Money::from_cents(fresh_cash.cents() / 16);
+            let bid_qty = u64::try_from(bid_budget.checked_div_euclid(bid_px.cents())?.cents())
+                .unwrap_or(0)
+                .min(100);
+            if bid_qty >= 5 {
+                self.submit_clob_limit_order(sov_id, inst_id, OrderSide::Bid, bid_px, bid_qty)?;
+            }
+        }
+
+        // ServiceCredit (`PLEX SC`) market-making by CapitalistsExecutives
+        if let Some((_, _, cap_entity)) = self.all_cohort_entities() {
+            let sc_books: Vec<InstrumentId> = self
+                .order_books
+                .iter()
+                .filter_map(|(id, b)| match b.kind {
+                    InstrumentKind::ServiceCredit => Some(id),
+                    _ => None,
+                })
+                .collect();
+            for inst_id in sc_books {
+                self.cancel_all_orders_for_entity_on_book(inst_id, cap_entity)?;
+                let ref_px = self
+                    .order_books
+                    .get(inst_id)
+                    .map_or(Money::from_dollars(1_000), |b| b.luld_reference_price);
+                let bid_px = Money::from_cents(((ref_px.cents() * 98) / 100).max(1_000));
+                let ask_px = Money::from_cents(((ref_px.cents() * 102) / 100).max(bid_px.cents() + 100));
+
+                let cap_sc = self
+                    .service_credit_positions
+                    .get(&cap_entity)
+                    .map_or(0, |p| p.available_credits());
+                if cap_sc >= 20 {
+                    let ask_qty = (cap_sc / 25).clamp(2, 25);
+                    self.submit_clob_limit_order(
+                        cap_entity,
+                        inst_id,
+                        OrderSide::Ask,
+                        ask_px,
+                        ask_qty,
+                    )?;
+                }
+                let cap_cash = self.ledger.available_cash(cap_entity)?;
+                if cap_cash > Money::from_dollars(900_000) {
+                    self.submit_clob_limit_order(cap_entity, inst_id, OrderSide::Bid, bid_px, 5)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Guard #2: Checks 115% maintenance margin on all open `ShortPositionRecord`s and triggers
+    /// an automatic CLOB Forced Buy-In when `collateral_reserved_cash * 10_000 < mark_liability * 11_500`.
+    fn run_subphase_3_short_maintenance_margin(&mut self) -> Result<(), CoreError> {
+        let loan_ids: Vec<ShortLoanId> = self.short_positions.keys().copied().collect();
+        for loan_id in loan_ids {
+            let Some((corp_id, borrowed_shares, collateral)) = self
+                .short_positions
+                .get(&loan_id)
+                .map(|s| (s.corp_id, s.borrowed_shares, s.collateral_reserved_cash))
+            else {
+                continue;
+            };
+            let mark_price = self
+                .corporations
+                .get(corp_id)
+                .and_then(|c| c.equity_instrument_id)
+                .and_then(|id| self.order_books.get(id))
+                .map_or(Money::from_dollars(25), |b| b.last_price);
+            let mark_liability = mark_price.checked_mul_u64(borrowed_shares)?;
+            let (maint_required, _) = mark_liability.mul_div_rem_u64(11_500, BPS_DENOMINATOR)?;
+            if collateral < maint_required {
+                let max_buy = Money::from_cents(mark_price.cents().saturating_mul(2));
+                self.execute_cover_short_position(loan_id, max_buy)?;
+            }
+        }
+        Ok(())
+    }
+
     fn run_subphase_4_retail_consumption(&mut self) -> Result<(), CoreError> {
         let tick = self.current_tick.0;
 
@@ -1669,11 +2313,16 @@ impl WorldState {
                 .iter()
                 .filter_map(|(corp_id, c)| match c.role {
                     CorporationRole::Retailer { retail_sku } if retail_sku == sku_id => {
+                        let effective_brand = if c.cloud_tier == CloudTier::Offline {
+                            (c.brand_score_bps / 2).max(1_000)
+                        } else {
+                            c.brand_score_bps
+                        };
                         Some(RetailStoreOffer {
                             seller_corp_id: corp_id,
                             unit_price: c.posted_selling_price,
                             quality_score_bps: c.quality_score_bps,
-                            brand_score_bps: c.brand_score_bps,
+                            brand_score_bps: effective_brand,
                             available_units: c.inventory_lot(sku_id).available_qty(),
                         })
                     }
@@ -1713,6 +2362,9 @@ impl WorldState {
                     seller.monthly_units_sold = seller
                         .monthly_units_sold
                         .saturating_add(settlement.units_sold);
+                    seller.monthly_genuine_b2c_revenue = seller
+                        .monthly_genuine_b2c_revenue
+                        .checked_add(settlement.gross_revenue)?;
                 }
 
                 let h_exp = self
@@ -1758,7 +2410,7 @@ impl WorldState {
 
         let corp_ids: Vec<CorpId> = self.corporations.keys().collect();
 
-        // 5A. Pay daily non-capitalized wages (Retailers pay WageEarners proportionally to active stock/sales;
+        // 5A. Pay daily non-capitalized wages (Retailers, Logistics, and Security pay WageEarners;
         // all corporations pay ManagersSkilled only when operating above their 5-day survival reserve)
         for &corp_id in &corp_ids {
             let (entity_id, role, wage_bill, mgr_bill, has_stock_or_sales) = {
@@ -1773,6 +2425,8 @@ impl WorldState {
                     | CorporationRole::ResourceExtractor { output_sku } => {
                         c.inventory_lot(output_sku).total_qty() > 0 || c.monthly_units_output > 0
                     }
+                    CorporationRole::LogisticsTrucking { .. }
+                    | CorporationRole::PrivateSecurity { .. } => true,
                 };
                 (
                     c.entity_id,
@@ -1785,7 +2439,13 @@ impl WorldState {
 
             let survival_floor = wage_bill.checked_add(mgr_bill)?.checked_mul_u64(5)?;
 
-            if matches!(role, CorporationRole::Retailer { .. }) && wage_bill.is_positive() {
+            if matches!(
+                role,
+                CorporationRole::Retailer { .. }
+                    | CorporationRole::LogisticsTrucking { .. }
+                    | CorporationRole::PrivateSecurity { .. }
+            ) && wage_bill.is_positive()
+            {
                 let avail = self.ledger.available_cash(entity_id)?;
                 if avail > survival_floor {
                     let effective_wage = if has_stock_or_sales {
@@ -1816,7 +2476,7 @@ impl WorldState {
             }
         }
 
-                // 5B. Daily 30/360 Loan Interest & Deposit Interest Accruals (preserving 5-day survival working-capital floor)
+        // 5B. Daily 30/360 Loan Interest, Deposit Interest, Short-Locate Borrow Fees & Tax Lien Garnishment
         for &corp_id in &corp_ids {
             let Some((entity_id, survival_floor)) = self.corporations.get(corp_id).and_then(|c| {
                 let floor = c
@@ -1848,6 +2508,7 @@ impl WorldState {
                 )?;
             self.bank
                 .accrue_and_pay_daily_deposit_interest(&mut self.ledger, tick, entity_id)?;
+            self.garnish_tax_lien_if_any(tick, entity_id, survival_floor)?;
         }
 
         for (_, cohort) in &self.cohorts {
@@ -1858,19 +2519,26 @@ impl WorldState {
             )?;
         }
 
-        // 5C. Monthly Dividend Distribution & Bank Net Interest Income Recycling (at Day 30 of each month)
+        self.accrue_daily_short_borrow_fees(tick)?;
+
+        // 5C. Monthly SovereignCloud Billing, Dividend Distribution, Bank & Sovereign Fiscal Recycling (at Day 30)
         if self.current_tick.is_month_end() {
+            self.bill_monthly_sovereign_cloud(tick)?;
             self.recycle_monthly_bank_net_income(tick)?;
+            self.recycle_monthly_sovereign_surplus(tick)?;
             for &corp_id in &corp_ids {
                 self.distribute_monthly_dividend(tick, corp_id)?;
             }
         }
 
-        // 5D. Quarterly Income Statement Closing into Retained Earnings (every 90 ticks)
+        // 5D. Quarterly Depositary Dividends & Income Statement Closing into Retained Earnings (every 90 ticks)
         if self.current_tick.is_quarter_end() {
+            self.distribute_quarterly_depositary_dividends(tick)?;
             let bank_id = self.bank.bank_id()?;
             self.ledger
                 .close_income_statement_for_entity(tick, bank_id)?;
+            self.ledger
+                .close_income_statement_for_entity(tick, self.sovereign_entity_id)?;
             for &corp_id in &corp_ids {
                 if let Some(c) = self.corporations.get(corp_id) {
                     self.ledger
@@ -1982,7 +2650,7 @@ impl WorldState {
     }
 
     fn distribute_monthly_dividend(&mut self, tick: u64, corp_id: CorpId) -> Result<(), CoreError> {
-        let (entity_id, payout_bps, working_floor, idle_cash_ceiling) = {
+        let (entity_id, payout_bps, working_floor, idle_cash_ceiling, total_shares) = {
             let Some(c) = self.corporations.get(corp_id) else {
                 return Ok(());
             };
@@ -1995,7 +2663,13 @@ impl WorldState {
                 c.working_capital_floor(20, debt, self.bank.default_loan_rate_bps)?;
             let ceiling =
                 c.working_capital_floor(180, debt, self.bank.default_loan_rate_bps)?;
-            (c.entity_id, c.target_dividend_payout_bps, floor, ceiling)
+            (
+                c.entity_id,
+                c.target_dividend_payout_bps,
+                floor,
+                ceiling,
+                c.total_shares_outstanding.max(1),
+            )
         };
 
         let avail_cash = self.ledger.available_cash(entity_id)?;
@@ -2088,7 +2762,1591 @@ impl WorldState {
         }
 
         self.ledger.post_entry(&entry)?;
+
+        // Guard #2: Collect Payment-in-Lieu-of-Dividend (PIL) from open `ShortPositionRecord`s on `corp_id`
+        let open_shorts: Vec<ShortLoanId> = self
+            .short_positions
+            .iter()
+            .filter_map(|(&lid, s)| (s.corp_id == corp_id).then_some(lid))
+            .collect();
+
+        for loan_id in open_shorts {
+            let Some((borrower_id, lender_id, borrowed_shares, collateral)) =
+                self.short_positions.get(&loan_id).map(|s| {
+                    (
+                        s.borrower_entity_id,
+                        s.lender_entity_id,
+                        s.borrowed_shares,
+                        s.collateral_reserved_cash,
+                    )
+                })
+            else {
+                continue;
+            };
+            let (pil_due, _) =
+                total_dividend.mul_div_rem_u64(borrowed_shares, u128::from(total_shares))?;
+            if !pil_due.is_positive() {
+                continue;
+            }
+            let avail_unreserved = self.ledger.available_cash(borrower_id)?;
+            let pay = if avail_unreserved >= pil_due {
+                pil_due
+            } else {
+                let shortfall = pil_due.checked_sub(avail_unreserved)?;
+                let from_collat = shortfall.min(collateral);
+                if from_collat.is_positive() {
+                    self.ledger.release_reserved_cash(borrower_id, from_collat)?;
+                    if let Some(s) = self.short_positions.get_mut(&loan_id) {
+                        s.collateral_reserved_cash =
+                            s.collateral_reserved_cash.checked_sub(from_collat)?;
+                    }
+                }
+                avail_unreserved.checked_add(from_collat)?
+            };
+            if pay.is_positive() {
+                let b_int = self
+                    .ledger
+                    .entity_account_id(borrower_id, StandardAccountCode::InterestExpense)?;
+                let b_cash = self
+                    .ledger
+                    .entity_account_id(borrower_id, StandardAccountCode::CashAndDeposits)?;
+                let l_cash = self
+                    .ledger
+                    .entity_account_id(lender_id, StandardAccountCode::CashAndDeposits)?;
+                let l_div = self
+                    .ledger
+                    .entity_account_id(lender_id, StandardAccountCode::DividendIncome)?;
+                let pil_entry =
+                    JournalEntry::new(tick, "Short-Sale Payment-in-Lieu-of-Dividend")
+                        .debit(b_int, pay)
+                        .credit(b_cash, pay)
+                        .debit(l_cash, pay)
+                        .credit(l_div, pay);
+                self.ledger.post_entry(&pil_entry)?;
+            }
+        }
+
         Ok(())
+    }
+
+    fn execute_authority_mint_service_credit(
+        &mut self,
+        recipient_entity_id: EntityId,
+        credits: u64,
+        webhook_ref: String,
+    ) -> Result<(), CoreError> {
+        if credits == 0 || webhook_ref.trim().is_empty() {
+            return Err(CoreError::InvalidOrder {
+                reason: "ServiceCredit mint requires credits > 0 and non-empty webhook_ref"
+                    .to_owned(),
+            });
+        }
+        // Guard #5: Idempotent webhook reference check
+        if !self.processed_webhook_refs.insert(webhook_ref) {
+            return Ok(());
+        }
+        // Verify entity exists in ledger
+        let _ = self.ledger.cash_balance(recipient_entity_id)?;
+        let pos = self
+            .service_credit_positions
+            .entry(recipient_entity_id)
+            .or_default();
+        pos.owned_credits = pos.owned_credits.saturating_add(credits);
+        self.total_service_credits_supply =
+            self.total_service_credits_supply.saturating_add(credits);
+        Ok(())
+    }
+
+    fn execute_ingest_oracle_price_tick(
+        &mut self,
+        instrument_id: InstrumentId,
+        new_oracle_price: Money,
+    ) -> Result<(), CoreError> {
+        if !new_oracle_price.is_positive() {
+            return Err(CoreError::InvalidOrder {
+                reason: "oracle price must be strictly positive".to_owned(),
+            });
+        }
+        let is_dr = {
+            let book = self
+                .order_books
+                .get_mut(instrument_id)
+                .ok_or(CoreError::UnknownInstrument(instrument_id))?;
+            if !matches!(book.kind, InstrumentKind::DepositaryReceipt { .. }) {
+                return Err(CoreError::InvalidOrder {
+                    reason: "IngestOraclePriceTick only applies to DepositaryReceipt instruments"
+                        .to_owned(),
+                });
+            }
+            // Guard #3: Immediately re-center LULD reference price to new_oracle_price
+            book.reanchor_luld_reference(new_oracle_price);
+            true
+        };
+        if is_dr {
+            self.run_subphase_3_depositary_and_sc_market_making()?;
+        }
+        Ok(())
+    }
+
+    pub fn execute_found_private_sme(
+        &mut self,
+        founder_entity_id: EntityId,
+        ticker: &str,
+        name: &str,
+        role: CorporationRole,
+        seed_capital: Money,
+    ) -> Result<CorpId, CoreError> {
+        let min_seed = Money::from_dollars(50_000);
+        if seed_capital < min_seed {
+            return Err(CoreError::InvalidOrder {
+                reason: format!("SME seed_capital must be at least {min_seed}, got {seed_capital}"),
+            });
+        }
+        let clean_ticker = ticker.trim().to_uppercase();
+        if clean_ticker.is_empty()
+            || self
+                .corporations
+                .values()
+                .any(|c| c.ticker.eq_ignore_ascii_case(&clean_ticker))
+        {
+            return Err(CoreError::InvalidOrder {
+                reason: format!("invalid or duplicate SME ticker '{clean_ticker}'"),
+            });
+        }
+
+        let avail = self.ledger.available_cash(founder_entity_id)?;
+        if avail < seed_capital {
+            return Err(CoreError::InvalidOrder {
+                reason: format!(
+                    "founder insufficient available cash: available {avail}, requested {seed_capital}"
+                ),
+            });
+        }
+
+        let tick = self.current_tick.0;
+        let sme_entity = self.ledger.register_entity(name, false);
+
+        // Transfer seed capital from founder to SME (founder capitalizes CommonStock investment; SME records CommonStock equity)
+        let f_eq = self
+            .ledger
+            .entity_account_id(founder_entity_id, StandardAccountCode::CommonStock)?;
+        let f_cash = self
+            .ledger
+            .entity_account_id(founder_entity_id, StandardAccountCode::CashAndDeposits)?;
+        let s_cash = self
+            .ledger
+            .entity_account_id(sme_entity, StandardAccountCode::CashAndDeposits)?;
+        let s_eq = self
+            .ledger
+            .entity_account_id(sme_entity, StandardAccountCode::CommonStock)?;
+
+        let entry = JournalEntry::new(tick, "Private SME Incorporation Seed Capital")
+            .debit(f_eq, seed_capital)
+            .credit(f_cash, seed_capital)
+            .debit(s_cash, seed_capital)
+            .credit(s_eq, seed_capital);
+        self.ledger.post_entry(&entry)?;
+
+        let default_price = match role {
+            CorporationRole::ResourceExtractor { output_sku }
+            | CorporationRole::Retailer { retail_sku: output_sku } => self
+                .skus
+                .get(output_sku)
+                .map_or(Money::from_dollars(200), |s| s.base_reference_price),
+            CorporationRole::Manufacturer { output_sku, .. } => {
+                let r = self
+                    .skus
+                    .get(output_sku)
+                    .map_or(Money::from_dollars(200), |s| s.base_reference_price);
+                Money::from_cents((r.cents() * 60) / 100)
+            }
+            CorporationRole::LogisticsTrucking { .. } => Money::from_dollars(15),
+            CorporationRole::PrivateSecurity { .. } => Money::from_dollars(2_500),
+        };
+        let max_bid = Money::from_cents((default_price.cents() * 80) / 100);
+
+        let initial_shares = 100_000u64;
+        let corp_id = self.corporations.insert_with_key(|cid| Corporation {
+            corp_id: cid,
+            entity_id: sme_entity,
+            equity_instrument_id: None,
+            ticker: clean_ticker,
+            name: name.to_owned(),
+            role,
+            persona_kind: ExecutivePersonaKind::BalancedExecutive,
+            delegation: AiDelegationConfig::player_default(),
+            daily_capacity: 60,
+            daily_wage_bill: Money::from_dollars(1_200),
+            daily_manager_bill: Money::from_dollars(600),
+            posted_selling_price: default_price,
+            max_input_bid_price: max_bid,
+            quality_score_bps: 10_000,
+            brand_score_bps: 10_000,
+            target_dividend_payout_bps: 2_500,
+            total_shares_outstanding: initial_shares,
+            last_monthly_dividend_paid: Money::ZERO,
+            founded_tick: tick,
+            founder_entity_id: Some(founder_entity_id),
+            founder_lockup_until_tick: 0,
+            founder_locked_shares: 0,
+            cloud_tier: CloudTier::Tier1PosWire,
+            subscribed_cloud_tier: CloudTier::Tier1PosWire,
+            monthly_units_output: 0,
+            monthly_units_sold: 0,
+            monthly_genuine_b2c_revenue: Money::ZERO,
+            monthly_laundered_cash: Money::ZERO,
+            ransomware_degraded_until_tick: 0,
+            security_shield_until_tick: 0,
+            logistics_shield_until_tick: 0,
+            inventory: BTreeMap::new(),
+        });
+
+        self.equity_positions.insert(
+            (corp_id, founder_entity_id),
+            EquityPosition {
+                owned_shares: initial_shares,
+                reserved_shares: 0,
+            },
+        );
+
+        Ok(corp_id)
+    }
+
+    pub fn execute_launch_ipo_auction(
+        &mut self,
+        corp_id: CorpId,
+        primary_shares_to_issue: u64,
+        offer_price: Money,
+    ) -> Result<InstrumentId, CoreError> {
+        if primary_shares_to_issue == 0 || !offer_price.is_positive() {
+            return Err(CoreError::IpoGateViolation {
+                reason: "primary_shares_to_issue and offer_price must be strictly positive"
+                    .to_owned(),
+            });
+        }
+        let tick = self.current_tick.0;
+        let (entity_id, ticker, founded_tick, div_bps, founder_id, already_listed) = {
+            let corp = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            (
+                corp.entity_id,
+                corp.ticker.clone(),
+                corp.founded_tick,
+                corp.target_dividend_payout_bps,
+                corp.founder_entity_id,
+                corp.equity_instrument_id.is_some(),
+            )
+        };
+
+        if already_listed {
+            return Err(CoreError::IpoGateViolation {
+                reason: format!("{ticker} is already publicly listed on the Equity Board"),
+            });
+        }
+        let operating_age = tick.saturating_sub(founded_tick);
+        if operating_age < 90 {
+            return Err(CoreError::IpoGateViolation {
+                reason: format!(
+                    "{ticker} operating history ({operating_age} ticks) < 90-tick IPO minimum"
+                ),
+            });
+        }
+        if div_bps < 2_000 {
+            return Err(CoreError::IpoGateViolation {
+                reason: format!(
+                    "{ticker} dividend policy ({div_bps} bps) < 2,000 bps (20%) IPO minimum"
+                ),
+            });
+        }
+
+        let report = FinancialStatementReport::generate(&self.ledger, entity_id, tick)?;
+        let retained_earnings = self
+            .ledger
+            .entity_balance(entity_id, StandardAccountCode::RetainedEarnings)?;
+        let cumulative_operating_profit = report.net_income.checked_add(retained_earnings)?;
+        if !report.net_income.is_positive() && !cumulative_operating_profit.is_positive() {
+            return Err(CoreError::IpoGateViolation {
+                reason: format!(
+                    "{ticker} trailing/cumulative operating profit ({cumulative_operating_profit}) must be strictly positive for IPO"
+                ),
+            });
+        }
+        let min_equity = Money::from_dollars(250_000);
+        if report.total_equity_including_net_income < min_equity {
+            return Err(CoreError::IpoGateViolation {
+                reason: format!(
+                    "{ticker} GAAP book equity ({}) < {min_equity} IPO gate",
+                    report.total_equity_including_net_income
+                ),
+            });
+        }
+
+        // Lock 50% of founder's shares for 180 ticks
+        let locked_shares = if let Some(fid) = founder_id {
+            self.equity_positions
+                .get(&(corp_id, fid))
+                .map_or(0, |p| p.owned_shares / 2)
+        } else {
+            0
+        };
+
+        let eq_ticker = format!("{ticker} EQ");
+        let inst_id = self.order_books.insert_with_key(|iid| {
+            CentralLimitOrderBook::new(iid, eq_ticker, InstrumentKind::Equity { corp_id }, offer_price)
+        });
+
+        if let Some(corp) = self.corporations.get_mut(corp_id) {
+            corp.equity_instrument_id = Some(inst_id);
+            corp.founder_lockup_until_tick = tick.saturating_add(180);
+            corp.founder_locked_shares = locked_shares;
+            corp.total_shares_outstanding = corp
+                .total_shares_outstanding
+                .saturating_add(primary_shares_to_issue);
+        }
+
+        // Allocate newly issued primary shares into treasury first, then underwrite against CapitalistsExecutives
+        // (up to 25% of Capitalists' available cash) and post any remainder on the new CLOB book.
+        let mut underwritten_shares = 0u64;
+        if let Some((_, _, cap_entity)) = self.all_cohort_entities() {
+            let cap_avail = self.ledger.available_cash(cap_entity)?;
+            let max_underwrite_budget = Money::from_cents(cap_avail.cents() / 4);
+            let affordable = u64::try_from(
+                max_underwrite_budget
+                    .checked_div_euclid(offer_price.cents())?
+                    .cents(),
+            )
+            .unwrap_or(0);
+            underwritten_shares = primary_shares_to_issue.min(affordable);
+
+            if underwritten_shares > 0 {
+                let gross_proceeds = offer_price.checked_mul_u64(underwritten_shares)?;
+                let (underwriting_fee, _) =
+                    gross_proceeds.mul_div_rem_u64(300, BPS_DENOMINATOR)?;
+                let net_proceeds = gross_proceeds.checked_sub(underwriting_fee)?;
+
+                let cap_eq = self
+                    .ledger
+                    .entity_account_id(cap_entity, StandardAccountCode::CommonStock)?;
+                let cap_cash = self
+                    .ledger
+                    .entity_account_id(cap_entity, StandardAccountCode::CashAndDeposits)?;
+                let c_cash = self
+                    .ledger
+                    .entity_account_id(entity_id, StandardAccountCode::CashAndDeposits)?;
+                let c_eq = self
+                    .ledger
+                    .entity_account_id(entity_id, StandardAccountCode::CommonStock)?;
+                let c_tax = self
+                    .ledger
+                    .entity_account_id(entity_id, StandardAccountCode::TaxAndFineExpense)?;
+                let sov_cash = self.ledger.entity_account_id(
+                    self.sovereign_entity_id,
+                    StandardAccountCode::CashAndDeposits,
+                )?;
+                let sov_rev = self.ledger.entity_account_id(
+                    self.sovereign_entity_id,
+                    StandardAccountCode::TaxAndFeeRevenue,
+                )?;
+
+                let mut entry =
+                    JournalEntry::new(tick, "IPO Primary Offering Underwriting Settlement")
+                        .debit(cap_eq, gross_proceeds)
+                        .credit(cap_cash, gross_proceeds)
+                        .debit(c_cash, net_proceeds)
+                        .credit(c_eq, gross_proceeds);
+                if underwriting_fee.is_positive() {
+                    entry = entry
+                        .debit(c_tax, underwriting_fee)
+                        .debit(sov_cash, underwriting_fee)
+                        .credit(sov_rev, underwriting_fee);
+                }
+                self.ledger.post_entry(&entry)?;
+
+                let cap_pos = self
+                    .equity_positions
+                    .entry((corp_id, cap_entity))
+                    .or_default();
+                cap_pos.owned_shares = cap_pos.owned_shares.saturating_add(underwritten_shares);
+            }
+        }
+
+        let remainder = primary_shares_to_issue.saturating_sub(underwritten_shares);
+        if remainder > 0 {
+            let pos = self
+                .equity_positions
+                .entry((corp_id, entity_id))
+                .or_default();
+            pos.owned_shares = pos.owned_shares.saturating_add(remainder);
+            self.submit_clob_limit_order(entity_id, inst_id, OrderSide::Ask, offer_price, remainder)?;
+        }
+
+        Ok(inst_id)
+    }
+
+    pub fn execute_borrow_shares_to_short(
+        &mut self,
+        borrower_entity_id: EntityId,
+        corp_id: CorpId,
+        shares: u64,
+        sell_limit_price: Money,
+    ) -> Result<ShortLoanId, CoreError> {
+        if shares == 0 || !sell_limit_price.is_positive() {
+            return Err(CoreError::ShortMarginViolation {
+                reason: "short borrow shares and sell_limit_price must be strictly positive"
+                    .to_owned(),
+            });
+        }
+        let (corp_entity, eq_inst_id) = {
+            let corp = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            let Some(eq_id) = corp.equity_instrument_id else {
+                return Err(CoreError::ShortMarginViolation {
+                    reason: "cannot short an unlisted private SME".to_owned(),
+                });
+            };
+            (corp.entity_id, eq_id)
+        };
+        if borrower_entity_id == corp_entity {
+            return Err(CoreError::ShortMarginViolation {
+                reason: "issuer corporation cannot short its own shares".to_owned(),
+            });
+        }
+
+        let Some((_, _, lender_entity_id)) = self.all_cohort_entities() else {
+            return Err(CoreError::ShortMarginViolation {
+                reason: "no institutional share lender cohort available".to_owned(),
+            });
+        };
+        if borrower_entity_id == lender_entity_id {
+            return Err(CoreError::ShortMarginViolation {
+                reason: "lender cohort cannot borrow from itself".to_owned(),
+            });
+        }
+
+        // Cancel resting orders for lender on this book so unreserved shares are maximized
+        self.cancel_all_orders_for_entity_on_book(eq_inst_id, lender_entity_id)?;
+        let lender_avail = self
+            .equity_positions
+            .get(&(corp_id, lender_entity_id))
+            .map_or(0, |p| p.available_shares());
+        if shares > lender_avail {
+            return Err(CoreError::ShortMarginViolation {
+                reason: format!(
+                    "Short-Locate Vault insufficient shares: available {lender_avail}, requested {shares}"
+                ),
+            });
+        }
+
+        let ref_price = self
+            .order_books
+            .get(eq_inst_id)
+            .map_or(sell_limit_price, |b| b.last_price.max(sell_limit_price));
+        let notional = ref_price.checked_mul_u64(shares)?;
+        let (initial_margin, _) = notional.mul_div_rem_u64(15_000, BPS_DENOMINATOR)?;
+
+        // Lock 150% cash collateral on borrower
+        self.ledger.reserve_cash(borrower_entity_id, initial_margin)?;
+
+        // Physically transfer borrowed shares from lender -> borrower (`sum(owned_shares)` stays invariant!)
+        if let Some(l_pos) = self.equity_positions.get_mut(&(corp_id, lender_entity_id)) {
+            l_pos.owned_shares -= shares;
+        }
+        let b_pos = self
+            .equity_positions
+            .entry((corp_id, borrower_entity_id))
+            .or_default();
+        b_pos.owned_shares = b_pos.owned_shares.saturating_add(shares);
+
+        let safe_sell_px = self
+            .order_books
+            .get(eq_inst_id)
+            .map_or(sell_limit_price, |b| b.clamp_luld_price(sell_limit_price));
+        self.submit_clob_limit_order(
+            borrower_entity_id,
+            eq_inst_id,
+            OrderSide::Ask,
+            safe_sell_px,
+            shares,
+        )?;
+
+        let loan_id = ShortLoanId(self.next_short_loan_seq);
+        self.next_short_loan_seq = self.next_short_loan_seq.saturating_add(1);
+        self.short_positions.insert(
+            loan_id,
+            ShortPositionRecord {
+                short_loan_id: loan_id,
+                borrower_entity_id,
+                lender_entity_id,
+                corp_id,
+                borrowed_shares: shares,
+                collateral_reserved_cash: initial_margin,
+                annual_borrow_fee_bps: 300,
+                fee_reserve: RoundingReserve::new(),
+            },
+        );
+
+        Ok(loan_id)
+    }
+
+    pub fn execute_cover_short_position(
+        &mut self,
+        short_loan_id: ShortLoanId,
+        max_buy_price: Money,
+    ) -> Result<(), CoreError> {
+        let record = self
+            .short_positions
+            .get(&short_loan_id)
+            .cloned()
+            .ok_or(CoreError::UnknownShortLoan(short_loan_id))?;
+
+        let eq_inst_id = self
+            .corporations
+            .get(record.corp_id)
+            .and_then(|c| c.equity_instrument_id)
+            .ok_or(CoreError::UnknownShortLoan(short_loan_id))?;
+
+        // 1. Cancel any open orders by borrower on this equity book (releasing any unsold borrowed shares)
+        self.cancel_all_orders_for_entity_on_book(eq_inst_id, record.borrower_entity_id)?;
+
+        // 2. Release locked short margin cash so borrower can use it to buy back shares
+        if record.collateral_reserved_cash.is_positive() {
+            self.ledger
+                .release_reserved_cash(record.borrower_entity_id, record.collateral_reserved_cash)?;
+        }
+
+        // 3. Check how many shares borrower currently holds vs needs to buy in
+        let currently_held = self
+            .equity_positions
+            .get(&(record.corp_id, record.borrower_entity_id))
+            .map_or(0, |p| p.available_shares());
+
+        if currently_held < record.borrowed_shares {
+            let deficit = record.borrowed_shares - currently_held;
+            let clamp_buy = self
+                .order_books
+                .get(eq_inst_id)
+                .map_or(max_buy_price, |b| b.clamp_luld_price(max_buy_price));
+            let avail_cash = self.ledger.available_cash(record.borrower_entity_id)?;
+            let affordable = u64::try_from(
+                avail_cash
+                    .checked_div_euclid(clamp_buy.cents().max(1))?
+                    .cents(),
+            )
+            .unwrap_or(0);
+            let buy_qty = deficit.min(affordable);
+            if buy_qty > 0 {
+                let (ord_id, _) = self.submit_clob_limit_order(
+                    record.borrower_entity_id,
+                    eq_inst_id,
+                    OrderSide::Bid,
+                    clamp_buy,
+                    buy_qty,
+                )?;
+                let _ = self.cancel_clob_limit_order(eq_inst_id, ord_id);
+            }
+        }
+
+        // 4. If still short (e.g., thin book or forced buy-in), settle remaining deficit directly against lender's shares at last_price
+        let held_after_clob = self
+            .equity_positions
+            .get(&(record.corp_id, record.borrower_entity_id))
+            .map_or(0, |p| p.available_shares());
+        let returnable = held_after_clob.min(record.borrowed_shares);
+
+        if returnable > 0 {
+            if let Some(b_pos) = self
+                .equity_positions
+                .get_mut(&(record.corp_id, record.borrower_entity_id))
+            {
+                b_pos.owned_shares -= returnable;
+            }
+            let l_pos = self
+                .equity_positions
+                .entry((record.corp_id, record.lender_entity_id))
+                .or_default();
+            l_pos.owned_shares = l_pos.owned_shares.saturating_add(returnable);
+        }
+
+        let remaining_borrowed = record.borrowed_shares.saturating_sub(returnable);
+        if remaining_borrowed == 0 {
+            self.short_positions.remove(&short_loan_id);
+        } else {
+            // Re-lock whatever cash remains up to 150% of remaining liability
+            let mark_px = self
+                .order_books
+                .get(eq_inst_id)
+                .map_or(Money::from_dollars(25), |b| b.last_price);
+            let rem_notional = mark_px.checked_mul_u64(remaining_borrowed)?;
+            let (desired_margin, _) = rem_notional.mul_div_rem_u64(15_000, BPS_DENOMINATOR)?;
+            let avail_left = self.ledger.available_cash(record.borrower_entity_id)?;
+            let new_collat = desired_margin.min(avail_left);
+            if new_collat.is_positive() {
+                self.ledger
+                    .reserve_cash(record.borrower_entity_id, new_collat)?;
+            }
+            if let Some(s) = self.short_positions.get_mut(&short_loan_id) {
+                s.borrowed_shares = remaining_borrowed;
+                s.collateral_reserved_cash = new_collat;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn accrue_daily_short_borrow_fees(&mut self, tick: u64) -> Result<(), CoreError> {
+        let loan_ids: Vec<ShortLoanId> = self.short_positions.keys().copied().collect();
+        for loan_id in loan_ids {
+            let Some((corp_id, borrower_id, lender_id, shares, fee_bps, collat)) =
+                self.short_positions.get(&loan_id).map(|s| {
+                    (
+                        s.corp_id,
+                        s.borrower_entity_id,
+                        s.lender_entity_id,
+                        s.borrowed_shares,
+                        s.annual_borrow_fee_bps,
+                        s.collateral_reserved_cash,
+                    )
+                })
+            else {
+                continue;
+            };
+            let mark_px = self
+                .corporations
+                .get(corp_id)
+                .and_then(|c| c.equity_instrument_id)
+                .and_then(|id| self.order_books.get(id))
+                .map_or(Money::from_dollars(25), |b| b.last_price);
+            let notional = mark_px.checked_mul_u64(shares)?;
+            let fee_due = match self.short_positions.get_mut(&loan_id) {
+                Some(s) => s.fee_reserve.accrue_daily_360_bps(notional, fee_bps)?,
+                None => Money::ZERO,
+            };
+            if !fee_due.is_positive() {
+                continue;
+            }
+
+            let avail = self.ledger.available_cash(borrower_id)?;
+            let pay = if avail >= fee_due {
+                fee_due
+            } else {
+                let short = fee_due.checked_sub(avail)?;
+                let from_collat = short.min(collat);
+                if from_collat.is_positive() {
+                    self.ledger.release_reserved_cash(borrower_id, from_collat)?;
+                    if let Some(s) = self.short_positions.get_mut(&loan_id) {
+                        s.collateral_reserved_cash =
+                            s.collateral_reserved_cash.checked_sub(from_collat)?;
+                    }
+                }
+                avail.checked_add(from_collat)?
+            };
+
+            if pay.is_positive() {
+                let b_int = self
+                    .ledger
+                    .entity_account_id(borrower_id, StandardAccountCode::InterestExpense)?;
+                let b_cash = self
+                    .ledger
+                    .entity_account_id(borrower_id, StandardAccountCode::CashAndDeposits)?;
+                let l_cash = self
+                    .ledger
+                    .entity_account_id(lender_id, StandardAccountCode::CashAndDeposits)?;
+                let l_int = self
+                    .ledger
+                    .entity_account_id(lender_id, StandardAccountCode::InterestIncome)?;
+                let entry = JournalEntry::new(tick, "Daily Short-Locate Share Borrow Fee")
+                    .debit(b_int, pay)
+                    .credit(b_cash, pay)
+                    .debit(l_cash, pay)
+                    .credit(l_int, pay);
+                self.ledger.post_entry(&entry)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_crime_operation(
+        &mut self,
+        actor_corp_id: CorpId,
+        target_corp_id: CorpId,
+        kind: CrimeOperationKind,
+        seq_no: u32,
+    ) -> Result<(), CoreError> {
+        if actor_corp_id == target_corp_id {
+            return Err(CoreError::InvalidOrder {
+                reason: "corporation cannot execute crime operation against itself".to_owned(),
+            });
+        }
+        let tick = self.current_tick.0;
+        let actor_entity = self
+            .corporations
+            .get(actor_corp_id)
+            .ok_or(CoreError::UnknownCorporation(actor_corp_id))?
+            .entity_id;
+        let (target_entity, target_cloud, sec_shield, log_shield) = {
+            let target = self
+                .corporations
+                .get(target_corp_id)
+                .ok_or(CoreError::UnknownCorporation(target_corp_id))?;
+            (
+                target.entity_id,
+                target.cloud_tier,
+                target.security_shield_until_tick > tick,
+                target.logistics_shield_until_tick > tick,
+            )
+        };
+
+        let mut rng = self.seeded_command_rng(seq_no);
+        let roll_bps: u32 = rng.gen_range(0..10_000);
+
+        match kind {
+            CrimeOperationKind::HijackCargo { contract_id } => {
+                // Logistics shield reduces success probability from 75% to 15%
+                let threshold = if log_shield { 1_500 } else { 7_500 };
+                if roll_bps >= threshold {
+                    return Ok(());
+                }
+                let Some(contract) = self
+                    .b2b_contracts
+                    .iter()
+                    .find(|c| c.contract_id == contract_id)
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                let supplier_id = contract.supplier_corp_id;
+                let sku_id = contract.sku_id;
+                let inv_code = self
+                    .skus
+                    .get(sku_id)
+                    .ok_or(CoreError::UnknownSku(sku_id))?
+                    .ledger_inventory_account;
+                let sup_entity = self
+                    .corporations
+                    .get(supplier_id)
+                    .ok_or(CoreError::UnknownCorporation(supplier_id))?
+                    .entity_id;
+                let avail_units = self
+                    .corporations
+                    .get(supplier_id)
+                    .map_or(0, |c| c.inventory_lot(sku_id).available_qty());
+                let stolen_qty = ((contract.daily_qty.saturating_mul(30)) / 100)
+                    .max(1)
+                    .min(avail_units);
+                if stolen_qty == 0 {
+                    return Ok(());
+                }
+
+                let stolen_book_value = self
+                    .corporations
+                    .get_mut(supplier_id)
+                    .ok_or(CoreError::UnknownCorporation(supplier_id))?
+                    .inventory_lot_mut(sku_id)
+                    .draw_unreserved_units(stolen_qty)?;
+
+                self.corporations
+                    .get_mut(actor_corp_id)
+                    .ok_or(CoreError::UnknownCorporation(actor_corp_id))?
+                    .inventory_lot_mut(sku_id)
+                    .record_addition(stolen_qty, stolen_book_value)?;
+
+                if stolen_book_value.is_positive() {
+                    let s_cogs = self
+                        .ledger
+                        .entity_account_id(sup_entity, StandardAccountCode::CostOfGoodsSold)?;
+                    let s_inv = self.ledger.entity_account_id(sup_entity, inv_code)?;
+                    let a_inv = self.ledger.entity_account_id(actor_entity, inv_code)?;
+                    let a_rev = self
+                        .ledger
+                        .entity_account_id(actor_entity, StandardAccountCode::SalesRevenue)?;
+                    let entry = JournalEntry::new(tick, "B2B Cargo Hijack WAC Seizure")
+                        .debit(s_cogs, stolen_book_value)
+                        .credit(s_inv, stolen_book_value)
+                        .debit(a_inv, stolen_book_value)
+                        .credit(a_rev, stolen_book_value);
+                    self.ledger.post_entry(&entry)?;
+                }
+            }
+            CrimeOperationKind::ExtortRetailer { demand_amount } => {
+                if !demand_amount.is_positive() {
+                    return Ok(());
+                }
+                // PrivateSecurity shield reduces extortion success from 80% to 10%
+                let threshold = if sec_shield { 1_000 } else { 8_000 };
+                if roll_bps >= threshold {
+                    return Ok(());
+                }
+                let target_avail = self.ledger.available_cash(target_entity)?;
+                let seized = demand_amount.min(Money::from_cents(target_avail.cents() / 2));
+                if seized.is_positive() {
+                    let t_exp = self.ledger.entity_account_id(
+                        target_entity,
+                        StandardAccountCode::SecurityAndFreightExpense,
+                    )?;
+                    let t_cash = self
+                        .ledger
+                        .entity_account_id(target_entity, StandardAccountCode::CashAndDeposits)?;
+                    let a_illicit = self
+                        .ledger
+                        .entity_account_id(actor_entity, StandardAccountCode::IllicitCash)?;
+                    let a_rev = self
+                        .ledger
+                        .entity_account_id(actor_entity, StandardAccountCode::SalesRevenue)?;
+                    let entry = JournalEntry::new(tick, "Syndicate Protection Extortion Transfer")
+                        .debit(t_exp, seized)
+                        .credit(t_cash, seized)
+                        .debit(a_illicit, seized)
+                        .credit(a_rev, seized);
+                    self.ledger.post_entry(&entry)?;
+                }
+            }
+            CrimeOperationKind::CyberRansomware { ransom_demand } => {
+                // Tier 3 Clef-Firewall blocks 90% of ransomware attacks
+                let threshold = if target_cloud == CloudTier::Tier3ClefFirewall {
+                    1_000
+                } else {
+                    7_500
+                };
+                if roll_bps >= threshold {
+                    return Ok(());
+                }
+                let target_avail = self.ledger.available_cash(target_entity)?;
+                let pay = ransom_demand.min(Money::from_cents(target_avail.cents() / 4));
+                if pay.is_positive() {
+                    let t_exp = self.ledger.entity_account_id(
+                        target_entity,
+                        StandardAccountCode::SecurityAndFreightExpense,
+                    )?;
+                    let t_cash = self
+                        .ledger
+                        .entity_account_id(target_entity, StandardAccountCode::CashAndDeposits)?;
+                    let a_illicit = self
+                        .ledger
+                        .entity_account_id(actor_entity, StandardAccountCode::IllicitCash)?;
+                    let a_rev = self
+                        .ledger
+                        .entity_account_id(actor_entity, StandardAccountCode::SalesRevenue)?;
+                    let entry = JournalEntry::new(tick, "Cyber Ransomware Settlement")
+                        .debit(t_exp, pay)
+                        .credit(t_cash, pay)
+                        .debit(a_illicit, pay)
+                        .credit(a_rev, pay);
+                    self.ledger.post_entry(&entry)?;
+                }
+                if let Some(target) = self.corporations.get_mut(target_corp_id) {
+                    target.ransomware_degraded_until_tick = tick.saturating_add(15);
+                }
+            }
+            CrimeOperationKind::CorporateWiretap { duration_ticks } => {
+                let threshold = if target_cloud == CloudTier::Tier3ClefFirewall {
+                    2_000
+                } else {
+                    8_500
+                };
+                if roll_bps < threshold {
+                    self.active_wiretaps.insert(
+                        (actor_corp_id, target_corp_id),
+                        tick.saturating_add(duration_ticks.max(30)),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_launder_illicit_cash(
+        &mut self,
+        corp_id: CorpId,
+        amount: Money,
+        seq_no: u32,
+    ) -> Result<(), CoreError> {
+        if !amount.is_positive() {
+            return Ok(());
+        }
+        let tick = self.current_tick.0;
+        let (entity_id, prev_laundered, genuine_b2c, is_retailer) = {
+            let corp = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            (
+                corp.entity_id,
+                corp.monthly_laundered_cash,
+                corp.monthly_genuine_b2c_revenue,
+                matches!(corp.role, CorporationRole::Retailer { .. }),
+            )
+        };
+
+        let illicit_bal = self.ledger.illicit_cash_balance(entity_id)?;
+        let launder_amt = amount.min(illicit_bal);
+        if !launder_amt.is_positive() {
+            return Ok(());
+        }
+
+        // 1. Standard 500 bps (5%) placement tax to SovereignTreasury
+        let (placement_tax, _) = launder_amt.mul_div_rem_u64(500, BPS_DENOMINATOR)?;
+        let clean_credited = launder_amt.checked_sub(placement_tax)?;
+
+        let c_cash = self
+            .ledger
+            .entity_account_id(entity_id, StandardAccountCode::CashAndDeposits)?;
+        let c_illicit = self
+            .ledger
+            .entity_account_id(entity_id, StandardAccountCode::IllicitCash)?;
+        let c_tax_exp = self
+            .ledger
+            .entity_account_id(entity_id, StandardAccountCode::TaxAndFineExpense)?;
+        let sov_cash = self.ledger.entity_account_id(
+            self.sovereign_entity_id,
+            StandardAccountCode::CashAndDeposits,
+        )?;
+        let sov_rev = self.ledger.entity_account_id(
+            self.sovereign_entity_id,
+            StandardAccountCode::TaxAndFeeRevenue,
+        )?;
+
+        let mut entry = JournalEntry::new(tick, "Retail Cash Placement Laundering")
+            .debit(c_cash, clean_credited)
+            .credit(c_illicit, launder_amt);
+        if placement_tax.is_positive() {
+            entry = entry
+                .debit(c_tax_exp, placement_tax)
+                .debit(sov_cash, placement_tax)
+                .credit(sov_rev, placement_tax);
+        }
+        self.ledger.post_entry(&entry)?;
+
+        let new_laundered = prev_laundered.checked_add(launder_amt)?;
+        if let Some(corp) = self.corporations.get_mut(corp_id) {
+            corp.monthly_laundered_cash = new_laundered;
+        }
+
+        // 2. Automated Statistical Forensic Audit & Guard #4 (Non-Negative Balance Protection on 150% Fine)
+        // Retailers have a $5,000 baseline + 35% of genuine B2C revenue safe harbor; non-retailers have $1,000 + 15%
+        let (safe_ratio_bps, baseline) = if is_retailer {
+            (3_500u64, Money::from_dollars(5_000))
+        } else {
+            (1_500u64, Money::from_dollars(1_000))
+        };
+        let (safe_from_rev, _) = genuine_b2c.mul_div_rem_u64(safe_ratio_bps, BPS_DENOMINATOR)?;
+        let safe_ceiling = safe_from_rev.checked_add(baseline)?;
+
+        if new_laundered > safe_ceiling {
+            let excess = new_laundered.checked_sub(safe_ceiling)?;
+            let mut rng = self.seeded_command_rng(seq_no);
+            let roll: u32 = rng.gen_range(0..10_000);
+            // If excess > safe_ceiling, 100% deterministic audit trigger; otherwise 75% trigger
+            if excess >= safe_ceiling || roll < 7_500 {
+                let (total_fine, _) = launder_amt.mul_div_rem_u64(15_000, BPS_DENOMINATOR)?;
+                let rem_illicit = self.ledger.illicit_cash_balance(entity_id)?;
+                let seize_illicit = total_fine.min(rem_illicit);
+                let rem_after_illicit = total_fine.checked_sub(seize_illicit)?;
+
+                let rem_clean = self.ledger.available_cash(entity_id)?;
+                let seize_clean = rem_after_illicit.min(rem_clean);
+                let unpaid_lien = rem_after_illicit.checked_sub(seize_clean)?;
+                let total_cash_seized = seize_illicit.checked_add(seize_clean)?;
+
+                let mut fine_entry =
+                    JournalEntry::new(tick, "Forensic Anti-Money-Laundering 150% Penalty")
+                        .debit(c_tax_exp, total_fine)
+                        .credit(sov_rev, total_fine);
+
+                if seize_illicit.is_positive() {
+                    fine_entry = fine_entry.credit(c_illicit, seize_illicit);
+                }
+                if seize_clean.is_positive() {
+                    fine_entry = fine_entry.credit(c_cash, seize_clean);
+                }
+                if total_cash_seized.is_positive() {
+                    fine_entry = fine_entry.debit(sov_cash, total_cash_seized);
+                }
+                if unpaid_lien.is_positive() {
+                    let c_tax_pay = self
+                        .ledger
+                        .entity_account_id(entity_id, StandardAccountCode::TaxesPayable)?;
+                    let sov_ar = self.ledger.entity_account_id(
+                        self.sovereign_entity_id,
+                        StandardAccountCode::AccountsReceivable,
+                    )?;
+                    fine_entry = fine_entry
+                        .credit(c_tax_pay, unpaid_lien)
+                        .debit(sov_ar, unpaid_lien);
+                    let lien_entry = self.tax_liens.entry(entity_id).or_insert(Money::ZERO);
+                    *lien_entry = lien_entry.checked_add(unpaid_lien)?;
+                }
+
+                self.ledger.post_entry(&fine_entry)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn garnish_tax_lien_if_any(
+        &mut self,
+        tick: u64,
+        entity_id: EntityId,
+        survival_floor: Money,
+    ) -> Result<(), CoreError> {
+        let Some(&lien_due) = self.tax_liens.get(&entity_id) else {
+            return Ok(());
+        };
+        if !lien_due.is_positive() {
+            self.tax_liens.remove(&entity_id);
+            return Ok(());
+        }
+        let avail = self.ledger.available_cash(entity_id)?;
+        if avail <= survival_floor {
+            return Ok(());
+        }
+        let pay = lien_due.min(avail.checked_sub(survival_floor)?);
+        if !pay.is_positive() {
+            return Ok(());
+        }
+
+        let c_tax_pay = self
+            .ledger
+            .entity_account_id(entity_id, StandardAccountCode::TaxesPayable)?;
+        let c_cash = self
+            .ledger
+            .entity_account_id(entity_id, StandardAccountCode::CashAndDeposits)?;
+        let sov_cash = self.ledger.entity_account_id(
+            self.sovereign_entity_id,
+            StandardAccountCode::CashAndDeposits,
+        )?;
+        let sov_ar = self.ledger.entity_account_id(
+            self.sovereign_entity_id,
+            StandardAccountCode::AccountsReceivable,
+        )?;
+
+        let entry = JournalEntry::new(tick, "Senior Forensic Tax Lien Garnishment")
+            .debit(c_tax_pay, pay)
+            .credit(c_cash, pay)
+            .debit(sov_cash, pay)
+            .credit(sov_ar, pay);
+        self.ledger.post_entry(&entry)?;
+
+        let remaining = lien_due.checked_sub(pay)?;
+        if remaining.is_positive() {
+            self.tax_liens.insert(entity_id, remaining);
+        } else {
+            self.tax_liens.remove(&entity_id);
+        }
+        Ok(())
+    }
+
+    fn bill_monthly_sovereign_cloud(&mut self, tick: u64) -> Result<(), CoreError> {
+        let corp_ids: Vec<CorpId> = self.corporations.keys().collect();
+        for corp_id in corp_ids {
+            let Some((entity_id, desired_tier)) = self
+                .corporations
+                .get(corp_id)
+                .map(|c| (c.entity_id, c.subscribed_cloud_tier))
+            else {
+                continue;
+            };
+            if desired_tier == CloudTier::Offline {
+                if let Some(c) = self.corporations.get_mut(corp_id) {
+                    c.cloud_tier = CloudTier::Offline;
+                }
+                continue;
+            }
+
+            let sc_cost = desired_tier.monthly_service_credits();
+            let avail_sc = self
+                .service_credit_positions
+                .get(&entity_id)
+                .map_or(0, |p| p.available_credits());
+
+            if sc_cost > 0 && avail_sc >= sc_cost {
+                // Burn ServiceCredits directly (zero M1 impact)
+                if let Some(pos) = self.service_credit_positions.get_mut(&entity_id) {
+                    pos.owned_credits -= sc_cost;
+                }
+                self.total_service_credits_supply =
+                    self.total_service_credits_supply.saturating_sub(sc_cost);
+                if let Some(c) = self.corporations.get_mut(corp_id) {
+                    c.cloud_tier = desired_tier;
+                }
+                continue;
+            }
+
+            // Fallback: Pay monthly VC fee to SovereignTreasury (respecting 5-day survival floor)
+            let vc_fee = desired_tier.monthly_vc_cost();
+            let survival_floor = self.corporations.get(corp_id).map_or(Money::ZERO, |c| {
+                c.daily_wage_bill
+                    .checked_add(c.daily_manager_bill)
+                    .unwrap_or(Money::ZERO)
+                    .checked_mul_u64(5)
+                    .unwrap_or(Money::ZERO)
+            });
+            let avail_cash = self.ledger.available_cash(entity_id)?;
+            if avail_cash >= vc_fee.checked_add(survival_floor)? {
+                let c_cloud = self
+                    .ledger
+                    .entity_account_id(entity_id, StandardAccountCode::CloudServiceExpense)?;
+                let c_cash = self
+                    .ledger
+                    .entity_account_id(entity_id, StandardAccountCode::CashAndDeposits)?;
+                let sov_cash = self.ledger.entity_account_id(
+                    self.sovereign_entity_id,
+                    StandardAccountCode::CashAndDeposits,
+                )?;
+                let sov_rev = self.ledger.entity_account_id(
+                    self.sovereign_entity_id,
+                    StandardAccountCode::TaxAndFeeRevenue,
+                )?;
+
+                let entry = JournalEntry::new(tick, "Monthly SovereignCloud Enterprise Subscription")
+                    .debit(c_cloud, vc_fee)
+                    .credit(c_cash, vc_fee)
+                    .debit(sov_cash, vc_fee)
+                    .credit(sov_rev, vc_fee);
+                self.ledger.post_entry(&entry)?;
+                if let Some(c) = self.corporations.get_mut(corp_id) {
+                    c.cloud_tier = desired_tier;
+                }
+            } else if let Some(c) = self.corporations.get_mut(corp_id) {
+                // Graceful downgrade when unable to pay
+                c.cloud_tier = CloudTier::Offline;
+            }
+        }
+        Ok(())
+    }
+
+    /// Guard #1: Month-End Sovereign Fiscal Recycling (`80%` of `SovereignTreasury` cash above
+    /// `sovereign_dr_reserve_buffer` is recycled back into civil-service payroll and B2B procurement).
+    fn recycle_monthly_sovereign_surplus(&mut self, tick: u64) -> Result<(), CoreError> {
+        let sov_id = self.sovereign_entity_id;
+        let avail_cash = self.ledger.available_cash(sov_id)?;
+        if avail_cash <= self.sovereign_dr_reserve_buffer {
+            return Ok(());
+        }
+        let surplus = avail_cash.checked_sub(self.sovereign_dr_reserve_buffer)?;
+        let (recycle_pool, _) = surplus.mul_div_rem_u64(8_000, BPS_DENOMINATOR)?;
+        if !recycle_pool.is_positive() {
+            return Ok(());
+        }
+
+        let Some((wage_entity, mgr_entity, cap_entity)) = self.all_cohort_entities() else {
+            return Ok(());
+        };
+
+        let (wage_grant, _) = recycle_pool.mul_div_rem_u64(5_000, BPS_DENOMINATOR)?;
+        let (mgr_grant, _) = recycle_pool.mul_div_rem_u64(3_000, BPS_DENOMINATOR)?;
+        let cap_grant = recycle_pool
+            .checked_sub(wage_grant)?
+            .checked_sub(mgr_grant)?;
+
+        let sov_wage = self
+            .ledger
+            .entity_account_id(sov_id, StandardAccountCode::WageExpense)?;
+        let sov_cash = self
+            .ledger
+            .entity_account_id(sov_id, StandardAccountCode::CashAndDeposits)?;
+        let w_cash = self
+            .ledger
+            .entity_account_id(wage_entity, StandardAccountCode::CashAndDeposits)?;
+        let w_rev = self
+            .ledger
+            .entity_account_id(wage_entity, StandardAccountCode::SalesRevenue)?;
+        let m_cash = self
+            .ledger
+            .entity_account_id(mgr_entity, StandardAccountCode::CashAndDeposits)?;
+        let m_rev = self
+            .ledger
+            .entity_account_id(mgr_entity, StandardAccountCode::SalesRevenue)?;
+        let c_cash = self
+            .ledger
+            .entity_account_id(cap_entity, StandardAccountCode::CashAndDeposits)?;
+        let c_rev = self
+            .ledger
+            .entity_account_id(cap_entity, StandardAccountCode::SalesRevenue)?;
+
+        let mut entry = JournalEntry::new(tick, "Monthly Sovereign Fiscal Recycling Sweep")
+            .debit(sov_wage, recycle_pool)
+            .credit(sov_cash, recycle_pool);
+        if wage_grant.is_positive() {
+            entry = entry.debit(w_cash, wage_grant).credit(w_rev, wage_grant);
+        }
+        if mgr_grant.is_positive() {
+            entry = entry.debit(m_cash, mgr_grant).credit(m_rev, mgr_grant);
+        }
+        if cap_grant.is_positive() {
+            entry = entry.debit(c_cash, cap_grant).credit(c_rev, cap_grant);
+        }
+
+        self.ledger.post_entry(&entry)?;
+        Ok(())
+    }
+
+    fn distribute_quarterly_depositary_dividends(&mut self, tick: u64) -> Result<(), CoreError> {
+        let sov_id = self.sovereign_entity_id;
+        let dr_books: Vec<(InstrumentId, u32, Money)> = self
+            .order_books
+            .iter()
+            .filter_map(|(id, b)| match b.kind {
+                InstrumentKind::DepositaryReceipt {
+                    quarterly_dividend_bps,
+                    ..
+                } if quarterly_dividend_bps > 0 => {
+                    Some((id, quarterly_dividend_bps, b.last_price))
+                }
+                _ => None,
+            })
+            .collect();
+
+        for (inst_id, div_bps, last_px) in dr_books {
+            let holders: Vec<(EntityId, u64)> = self
+                .depositary_positions
+                .iter()
+                .filter_map(|(&(iid, holder_id), pos)| {
+                    if iid == inst_id && holder_id != sov_id && pos.owned_shares > 0 {
+                        Some((holder_id, pos.owned_shares))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let total_held: u64 = holders.iter().map(|(_, q)| *q).sum();
+            if total_held == 0 {
+                continue;
+            }
+            let total_notional = last_px.checked_mul_u64(total_held)?;
+            let (total_div, _) =
+                total_notional.mul_div_rem_u64(u64::from(div_bps), BPS_DENOMINATOR)?;
+            let sov_avail = self.ledger.available_cash(sov_id)?;
+            let distributable = total_div.min(Money::from_cents(sov_avail.cents() / 4));
+            if !distributable.is_positive() {
+                continue;
+            }
+
+            let allocations = allocate_hamilton(distributable, &holders)?;
+            let sov_re = self
+                .ledger
+                .entity_account_id(sov_id, StandardAccountCode::RetainedEarnings)?;
+            let sov_cash = self
+                .ledger
+                .entity_account_id(sov_id, StandardAccountCode::CashAndDeposits)?;
+            let mut entry =
+                JournalEntry::new(tick, "Quarterly Global Depositary Synthetic Dividend")
+                    .debit(sov_re, distributable)
+                    .credit(sov_cash, distributable);
+            for (holder_id, share_div) in allocations {
+                if share_div.is_positive() {
+                    let h_cash = self
+                        .ledger
+                        .entity_account_id(holder_id, StandardAccountCode::CashAndDeposits)?;
+                    let h_div = self
+                        .ledger
+                        .entity_account_id(holder_id, StandardAccountCode::DividendIncome)?;
+                    entry = entry.debit(h_cash, share_div).credit(h_div, share_div);
+                }
+            }
+            self.ledger.post_entry(&entry)?;
+        }
+        Ok(())
+    }
+
+    pub fn execute_send_wire_message(
+        &mut self,
+        sender_corp_id: CorpId,
+        recipient_corp_id: CorpId,
+        subject: String,
+        body: String,
+        attachment: Option<WireAttachment>,
+    ) -> Result<WireMessageId, CoreError> {
+        if !self.corporations.contains_key(sender_corp_id) {
+            return Err(CoreError::UnknownCorporation(sender_corp_id));
+        }
+        if !self.corporations.contains_key(recipient_corp_id) {
+            return Err(CoreError::UnknownCorporation(recipient_corp_id));
+        }
+        let message_id = WireMessageId(self.next_wire_seq);
+        self.next_wire_seq = self.next_wire_seq.saturating_add(1);
+        let status = if attachment.is_some() {
+            WireAttachmentStatus::Pending
+        } else {
+            WireAttachmentStatus::NoAttachment
+        };
+        self.wire_messages.push(WireMessage {
+            message_id,
+            tick: self.current_tick.0,
+            sender_corp_id,
+            recipient_corp_id,
+            subject,
+            body,
+            attachment,
+            status,
+        });
+        self.prune_resolved_wire_messages();
+        Ok(message_id)
+    }
+
+    pub fn execute_respond_wire_attachment(
+        &mut self,
+        responder_corp_id: CorpId,
+        message_id: WireMessageId,
+        accept: bool,
+    ) -> Result<(), CoreError> {
+        let msg_idx = self
+            .wire_messages
+            .iter()
+            .position(|m| m.message_id == message_id)
+            .ok_or(CoreError::UnknownWireMessage(message_id))?;
+
+        let msg = self
+            .wire_messages
+            .get(msg_idx)
+            .cloned()
+            .ok_or(CoreError::UnknownWireMessage(message_id))?;
+        if msg.recipient_corp_id != responder_corp_id {
+            return Err(CoreError::InvalidOrder {
+                reason: "only the recipient corporation can respond to a wire attachment"
+                    .to_owned(),
+            });
+        }
+        if msg.status != WireAttachmentStatus::Pending {
+            return Ok(());
+        }
+
+        if !accept {
+            if let Some(m) = self.wire_messages.get_mut(msg_idx) {
+                m.status = WireAttachmentStatus::Rejected;
+            }
+            self.prune_resolved_wire_messages();
+            return Ok(());
+        }
+
+        let tick = self.current_tick.0;
+        let sender_entity = self
+            .corporations
+            .get(msg.sender_corp_id)
+            .ok_or(CoreError::UnknownCorporation(msg.sender_corp_id))?
+            .entity_id;
+        let responder_entity = self
+            .corporations
+            .get(responder_corp_id)
+            .ok_or(CoreError::UnknownCorporation(responder_corp_id))?
+            .entity_id;
+
+        if let Some(attachment) = msg.attachment {
+            match attachment {
+                WireAttachment::B2BContractOffer {
+                    sku_id,
+                    daily_qty,
+                    unit_price,
+                    duration_days,
+                } => {
+                    let contract_id = ContractId(self.next_contract_seq);
+                    self.next_contract_seq = self.next_contract_seq.saturating_add(1);
+                    self.b2b_contracts.push(B2BSupplyContract {
+                        contract_id,
+                        supplier_corp_id: msg.sender_corp_id,
+                        buyer_corp_id: responder_corp_id,
+                        sku_id,
+                        daily_qty,
+                        unit_price,
+                        remaining_days: duration_days,
+                    });
+                }
+                WireAttachment::OtcBlockTradeOffer {
+                    instrument_id,
+                    qty,
+                    unit_price,
+                } => {
+                    // Atomic OTC Delivery-versus-Payment (sender sells `qty` of `instrument_id` to responder at `unit_price`)
+                    let kind = self
+                        .order_books
+                        .get(instrument_id)
+                        .ok_or(CoreError::UnknownInstrument(instrument_id))?
+                        .kind;
+                    let notional = unit_price.checked_mul_u64(qty)?;
+                    self.ledger.reserve_cash(responder_entity, notional)?;
+                    match kind {
+                        InstrumentKind::Equity { corp_id } => {
+                            let s_pos = self
+                                .equity_positions
+                                .entry((corp_id, sender_entity))
+                                .or_default();
+                            if s_pos.available_shares() < qty {
+                                self.ledger.release_reserved_cash(responder_entity, notional)?;
+                                return Err(CoreError::InsufficientShares {
+                                    corp_id,
+                                    available: s_pos.available_shares(),
+                                    requested: qty,
+                                });
+                            }
+                            s_pos.reserved_shares = s_pos.reserved_shares.saturating_add(qty);
+                        }
+                        InstrumentKind::DepositaryReceipt { .. } => {
+                            let s_pos = self
+                                .depositary_positions
+                                .entry((instrument_id, sender_entity))
+                                .or_default();
+                            if s_pos.available_shares() < qty {
+                                self.ledger.release_reserved_cash(responder_entity, notional)?;
+                                return Err(CoreError::InvalidOrder {
+                                    reason: "insufficient DR units for OTC block trade".to_owned(),
+                                });
+                            }
+                            s_pos.reserved_shares = s_pos.reserved_shares.saturating_add(qty);
+                        }
+                        InstrumentKind::ServiceCredit => {
+                            let s_pos = self
+                                .service_credit_positions
+                                .entry(sender_entity)
+                                .or_default();
+                            if s_pos.available_credits() < qty {
+                                self.ledger.release_reserved_cash(responder_entity, notional)?;
+                                return Err(CoreError::InvalidOrder {
+                                    reason: "insufficient ServiceCredits for OTC block trade"
+                                        .to_owned(),
+                                });
+                            }
+                            s_pos.reserved_credits = s_pos.reserved_credits.saturating_add(qty);
+                        }
+                        InstrumentKind::Commodity { sku_id } => {
+                            let s_corp = self
+                                .corporations
+                                .get_mut(msg.sender_corp_id)
+                                .ok_or(CoreError::UnknownCorporation(msg.sender_corp_id))?;
+                            if let Err(e) = s_corp.inventory_lot_mut(sku_id).reserve_units(qty) {
+                                self.ledger.release_reserved_cash(responder_entity, notional)?;
+                                return Err(CoreError::Ledger(e));
+                            }
+                        }
+                    }
+
+                    let otc_fill = TradeFill {
+                        tick,
+                        instrument_id,
+                        buyer_entity_id: responder_entity,
+                        seller_entity_id: sender_entity,
+                        bid_order_id: OrderId(0),
+                        ask_order_id: OrderId(0),
+                        execution_price: unit_price,
+                        buyer_limit_price: unit_price,
+                        qty,
+                    };
+                    self.settle_clob_fill(kind, &otc_fill)?;
+                }
+                WireAttachment::SyndicateExtortionDemand {
+                    demand_amount,
+                    immunity_days,
+                } => {
+                    let avail = self.ledger.available_cash(responder_entity)?;
+                    let pay = demand_amount.min(avail);
+                    if pay.is_positive() {
+                        let r_exp = self.ledger.entity_account_id(
+                            responder_entity,
+                            StandardAccountCode::SecurityAndFreightExpense,
+                        )?;
+                        let r_cash = self.ledger.entity_account_id(
+                            responder_entity,
+                            StandardAccountCode::CashAndDeposits,
+                        )?;
+                        let s_illicit = self
+                            .ledger
+                            .entity_account_id(sender_entity, StandardAccountCode::IllicitCash)?;
+                        let s_rev = self
+                            .ledger
+                            .entity_account_id(sender_entity, StandardAccountCode::SalesRevenue)?;
+                        let entry = JournalEntry::new(tick, "Wire Protection Tribute Settlement")
+                            .debit(r_exp, pay)
+                            .credit(r_cash, pay)
+                            .debit(s_illicit, pay)
+                            .credit(s_rev, pay);
+                        self.ledger.post_entry(&entry)?;
+                        if let Some(resp) = self.corporations.get_mut(responder_corp_id) {
+                            resp.security_shield_until_tick =
+                                tick.saturating_add(u64::from(immunity_days));
+                        }
+                    }
+                }
+                WireAttachment::ServiceRetainerOffer {
+                    is_security,
+                    daily_fee,
+                    duration_days,
+                } => {
+                    let total_fee = daily_fee.checked_mul_u64(u64::from(duration_days))?;
+                    let avail = self.ledger.available_cash(responder_entity)?;
+                    if avail >= total_fee && total_fee.is_positive() {
+                        let r_exp = self.ledger.entity_account_id(
+                            responder_entity,
+                            StandardAccountCode::SecurityAndFreightExpense,
+                        )?;
+                        let r_cash = self.ledger.entity_account_id(
+                            responder_entity,
+                            StandardAccountCode::CashAndDeposits,
+                        )?;
+                        let s_cash = self.ledger.entity_account_id(
+                            sender_entity,
+                            StandardAccountCode::CashAndDeposits,
+                        )?;
+                        let s_rev = self
+                            .ledger
+                            .entity_account_id(sender_entity, StandardAccountCode::SalesRevenue)?;
+                        let entry = JournalEntry::new(tick, "B2B Security/Logistics Retainer")
+                            .debit(r_exp, total_fee)
+                            .credit(r_cash, total_fee)
+                            .debit(s_cash, total_fee)
+                            .credit(s_rev, total_fee);
+                        self.ledger.post_entry(&entry)?;
+                        if let Some(resp) = self.corporations.get_mut(responder_corp_id) {
+                            let until = tick.saturating_add(u64::from(duration_days));
+                            if is_security {
+                                resp.security_shield_until_tick = until;
+                            } else {
+                                resp.logistics_shield_until_tick = until;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(m) = self.wire_messages.get_mut(msg_idx) {
+            m.status = WireAttachmentStatus::Accepted;
+        }
+        self.prune_resolved_wire_messages();
+        Ok(())
+    }
+
+    /// Guard #6: Bounds resolved (`NoAttachment`/`Accepted`/`Rejected`/`Expired`) wire messages
+    /// per corporation to `MAX_RESOLVED_WIRE_MESSAGES_PER_CORP` so `postcard` + `blake3` stays fast.
+    fn prune_resolved_wire_messages(&mut self) {
+        let mut counts_by_corp: BTreeMap<CorpId, usize> = BTreeMap::new();
+        let mut keep_flags = vec![true; self.wire_messages.len()];
+
+        for (idx, msg) in self.wire_messages.iter().enumerate().rev() {
+            if msg.status == WireAttachmentStatus::Pending {
+                continue;
+            }
+            let sender_count = counts_by_corp.get(&msg.sender_corp_id).copied().unwrap_or(0);
+            let recip_count = counts_by_corp
+                .get(&msg.recipient_corp_id)
+                .copied()
+                .unwrap_or(0);
+            if sender_count >= MAX_RESOLVED_WIRE_MESSAGES_PER_CORP
+                && recip_count >= MAX_RESOLVED_WIRE_MESSAGES_PER_CORP
+            {
+                if let Some(flag) = keep_flags.get_mut(idx) {
+                    *flag = false;
+                }
+            } else {
+                counts_by_corp.insert(msg.sender_corp_id, sender_count.saturating_add(1));
+                counts_by_corp.insert(msg.recipient_corp_id, recip_count.saturating_add(1));
+            }
+        }
+
+        let mut iter = keep_flags.into_iter();
+        self.wire_messages.retain(|_| iter.next().unwrap_or(true));
     }
 
     fn wage_and_manager_entities(&self) -> Option<(EntityId, EntityId)> {
@@ -2172,11 +4430,74 @@ impl WorldState {
             }
         }
 
+        // 4. Depositary Receipt unit conservation
+        for (&inst_id, &expected_units) in &self.depositary_total_units {
+            let mut sum_units = 0u64;
+            for (&(iid, _), pos) in &self.depositary_positions {
+                if iid != inst_id {
+                    continue;
+                }
+                if pos.reserved_shares > pos.owned_shares {
+                    return Err(CoreError::Ledger(LedgerError::TrialBalanceViolation {
+                        reason: format!(
+                            "DR {inst_id:?} reserved_shares ({}) > owned_shares ({})",
+                            pos.reserved_shares, pos.owned_shares
+                        ),
+                    }));
+                }
+                sum_units = sum_units.saturating_add(pos.owned_shares);
+            }
+            if sum_units != expected_units {
+                return Err(CoreError::Ledger(LedgerError::TrialBalanceViolation {
+                    reason: format!(
+                        "DR {inst_id:?} unit conservation mismatch: sum(owned_shares) ({sum_units}) != depositary_total_units ({expected_units})"
+                    ),
+                }));
+            }
+        }
+
+        // 5. ServiceCredit (`PLEX`) unit conservation
+        let mut sum_sc = 0u64;
+        for pos in self.service_credit_positions.values() {
+            if pos.reserved_credits > pos.owned_credits {
+                return Err(CoreError::Ledger(LedgerError::TrialBalanceViolation {
+                    reason: format!(
+                        "ServiceCredit reserved_credits ({}) > owned_credits ({})",
+                        pos.reserved_credits, pos.owned_credits
+                    ),
+                }));
+            }
+            sum_sc = sum_sc.saturating_add(pos.owned_credits);
+        }
+        if sum_sc != self.total_service_credits_supply {
+            return Err(CoreError::Ledger(LedgerError::TrialBalanceViolation {
+                reason: format!(
+                    "ServiceCredit supply mismatch: sum(owned_credits) ({sum_sc}) != total_service_credits_supply ({})",
+                    self.total_service_credits_supply
+                ),
+            }));
+        }
+
         Ok(())
     }
 
-    /// Projects an immutable `WorldView` snapshot for the 120 FPS `egui` terminal.
+    /// Projects an immutable `WorldView` snapshot for local/admin inspection (`viewer_corp_id = None`).
     pub fn build_world_view(&self) -> Result<WorldView, CoreError> {
+        self.build_authorized_world_view(None)
+    }
+
+    /// Guard #6: Projects an information-barrier-filtered `WorldView` for a specific authenticated
+    /// `viewer_corp_id` (or full admin/local view when `viewer_corp_id` is `None`).
+    ///
+    /// Masks:
+    /// - Rival `illicit_cash_balance` and `monthly_laundered_cash` (unless wiretapped by `viewer_corp_id`).
+    /// - Rival private `wire_messages` (unless `viewer_corp_id` is sender, recipient, or holds an active wiretap).
+    /// - Individual `ShortPositionRecord`s (exposing only aggregate `short_interest_shares` on `InstrumentSnapshot`,
+    ///   plus the viewer's own short positions or wiretapped targets' short positions).
+    pub fn build_authorized_world_view(
+        &self,
+        viewer_corp_id: Option<CorpId>,
+    ) -> Result<WorldView, CoreError> {
         let tick = self.current_tick;
         let bank_id = self.bank.bank_id()?;
         let bank_statement = FinancialStatementReport::generate(&self.ledger, bank_id, tick.0)?;
@@ -2186,14 +4507,39 @@ impl WorldState {
         let total_loans = self
             .ledger
             .entity_balance(bank_id, StandardAccountCode::LoansReceivable)?;
+        let sovereign_cash_balance = self.ledger.cash_balance(self.sovereign_entity_id)?;
+
+        let can_inspect_corp = |target_cid: CorpId| -> bool {
+            let Some(vcid) = viewer_corp_id else {
+                return true;
+            };
+            if vcid == target_cid {
+                return true;
+            }
+            self.active_wiretaps
+                .get(&(vcid, target_cid))
+                .is_some_and(|&exp| exp > tick.0)
+        };
 
         let mut instruments = Vec::with_capacity(self.order_books.len());
         for (_, book) in &self.order_books {
+            let short_interest_shares = match book.kind {
+                InstrumentKind::Equity { corp_id } => self
+                    .short_positions
+                    .values()
+                    .filter(|s| s.corp_id == corp_id)
+                    .map(|s| s.borrowed_shares)
+                    .sum(),
+                _ => 0,
+            };
             instruments.push(InstrumentSnapshot {
                 instrument_id: book.instrument_id,
                 ticker: book.ticker.clone(),
                 kind: book.kind,
                 last_price: book.last_price,
+                luld_reference_price: book.luld_reference_price,
+                luld_band_bps: book.luld_band_bps,
+                short_interest_shares,
                 best_bid: book.best_bid(),
                 best_ask: book.best_ask(),
                 top_bids: book.top_bid_levels(10),
@@ -2205,8 +4551,23 @@ impl WorldState {
 
         let mut corporations = Vec::with_capacity(self.corporations.len());
         for (_, corp) in &self.corporations {
+            let is_authorized = can_inspect_corp(corp.corp_id);
             let cash_balance = self.ledger.cash_balance(corp.entity_id)?;
             let available_cash = self.ledger.available_cash(corp.entity_id)?;
+            let illicit_cash_balance = if is_authorized {
+                self.ledger.illicit_cash_balance(corp.entity_id)?
+            } else {
+                Money::ZERO
+            };
+            let tax_lien_payable = self
+                .tax_liens
+                .get(&corp.entity_id)
+                .copied()
+                .unwrap_or(Money::ZERO);
+            let service_credits = self
+                .service_credit_positions
+                .get(&corp.entity_id)
+                .map_or(0, |p| p.available_credits());
             let loans_payable = self
                 .ledger
                 .entity_balance(corp.entity_id, StandardAccountCode::LoansPayable)?;
@@ -2229,6 +4590,11 @@ impl WorldState {
                 delegation: corp.delegation,
                 cash_balance,
                 available_cash,
+                illicit_cash_balance,
+                tax_lien_payable,
+                service_credits,
+                cloud_tier: corp.cloud_tier,
+                subscribed_cloud_tier: corp.subscribed_cloud_tier,
                 loans_payable,
                 daily_capacity: corp.daily_capacity,
                 daily_wage_bill: corp.daily_wage_bill,
@@ -2242,6 +4608,17 @@ impl WorldState {
                 share_price,
                 market_cap,
                 last_monthly_dividend_paid: corp.last_monthly_dividend_paid,
+                founded_tick: corp.founded_tick,
+                founder_lockup_until_tick: corp.founder_lockup_until_tick,
+                monthly_genuine_b2c_revenue: corp.monthly_genuine_b2c_revenue,
+                monthly_laundered_cash: if is_authorized {
+                    corp.monthly_laundered_cash
+                } else {
+                    Money::ZERO
+                },
+                ransomware_degraded_until_tick: corp.ransomware_degraded_until_tick,
+                security_shield_until_tick: corp.security_shield_until_tick,
+                logistics_shield_until_tick: corp.logistics_shield_until_tick,
                 inventory: corp.inventory.clone(),
                 financial_statement,
             });
@@ -2264,6 +4641,28 @@ impl WorldState {
             });
         }
 
+        let wire_messages: Vec<WireMessage> = self
+            .wire_messages
+            .iter()
+            .filter(|m| {
+                can_inspect_corp(m.sender_corp_id) || can_inspect_corp(m.recipient_corp_id)
+            })
+            .cloned()
+            .collect();
+
+        let visible_short_positions: Vec<ShortPositionRecord> = self
+            .short_positions
+            .values()
+            .filter(|s| {
+                if viewer_corp_id.is_none() {
+                    return true;
+                }
+                self.find_corp_by_entity(s.borrower_entity_id)
+                    .is_some_and(can_inspect_corp)
+            })
+            .cloned()
+            .collect();
+
         let mut sku_codes = BTreeMap::new();
         for (sku_id, sku) in &self.skus {
             sku_codes.insert(sku_id, sku.code.clone());
@@ -2276,13 +4675,43 @@ impl WorldState {
             bank_statement,
             bank_loan_rate_bps: self.bank.default_loan_rate_bps,
             bank_deposit_rate_bps: self.bank.deposit_rate_bps,
+            sovereign_entity_id: self.sovereign_entity_id,
+            sovereign_cash_balance,
+            sovereign_dr_reserve_buffer: self.sovereign_dr_reserve_buffer,
             total_m1_money_supply: total_m1,
             total_bank_loans: total_loans,
+            total_service_credits_supply: self.total_service_credits_supply,
             corporations,
             cohorts,
             instruments,
             active_b2b_contracts: self.b2b_contracts.clone(),
+            wire_messages,
+            visible_short_positions,
             sku_codes,
+        })
+    }
+
+    /// Builds a lightweight `ClobDeltaEvent` for an `InstrumentId` after an intraday order action.
+    pub fn build_clob_delta_event(
+        &self,
+        instrument_id: InstrumentId,
+        seq_no: u32,
+    ) -> Result<crate::wire::ClobDeltaEvent, CoreError> {
+        let book = self
+            .order_books
+            .get(instrument_id)
+            .ok_or(CoreError::UnknownInstrument(instrument_id))?;
+        Ok(crate::wire::ClobDeltaEvent {
+            tick: self.current_tick.0,
+            seq_no,
+            instrument_id,
+            ticker: book.ticker.clone(),
+            last_price: book.last_price,
+            best_bid: book.best_bid(),
+            best_ask: book.best_ask(),
+            top_bids: book.top_bid_levels(10),
+            top_asks: book.top_ask_levels(10),
+            recent_fills: book.recent_fills.iter().cloned().collect(),
         })
     }
 }

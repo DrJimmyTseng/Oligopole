@@ -3,8 +3,10 @@ use crate::error::CoreError;
 use crate::household::{HouseholdCohort, HouseholdCohortKind};
 use crate::ids::{CohortId, CorpId, InstrumentId, SkuId};
 use crate::production::{
-    AiDelegationConfig, Corporation, CorporationRole, ExecutivePersonaKind, SkuDefinition,
+    AiDelegationConfig, CloudTier, Corporation, CorporationRole, ExecutivePersonaKind,
+    SkuDefinition,
 };
+use crate::wire::ServiceCreditPosition;
 use crate::world::{EquityPosition, WorldState};
 use oligopole_ledger::{EntityId, Money, StandardAccountCode};
 use rust_decimal_macros::dec;
@@ -16,6 +18,10 @@ pub struct VerticalSliceHandles {
     pub iron_ore_sku: SkuId,
     pub appliance_sku: SkuId,
     pub iron_cmdty_book: InstrumentId,
+    pub plex_sc_book: InstrumentId,
+    pub googl_dr_book: InstrumentId,
+    pub meta_dr_book: InstrumentId,
+    pub nvda_dr_book: InstrumentId,
     pub iron_corp: CorpId,
     pub vale_corp: CorpId,
     pub acme_corp: CorpId,
@@ -33,10 +39,16 @@ pub fn build_vertical_slice_0(
 ) -> Result<(WorldState, VerticalSliceHandles), CoreError> {
     let mut world = WorldState::new(world_seed, 600, 180);
 
-    // 1. Capitalize Central & Commercial Bank reserves
+    // 1. Capitalize Central & Commercial Bank reserves & Sovereign Treasury initial reserve
     world
         .bank
         .seed_bank_equity_reserves(&mut world.ledger, 0, Money::from_dollars(25_000_000))?;
+    world.bank.seed_initial_deposit_endowment(
+        &mut world.ledger,
+        0,
+        world.sovereign_entity_id,
+        Money::from_dollars(1_000_000),
+    )?;
 
     // 2. Register SKUs
     let iron_ore_sku = world.skus.insert_with_key(|id| SkuDefinition {
@@ -55,7 +67,7 @@ pub fn build_vertical_slice_0(
         base_reference_price: Money::from_dollars(220),
     });
 
-    // 3. Register Commodity CLOB for IRON_ORE
+    // 3. Register Commodity CLOB for IRON_ORE, ServiceCredit (`PLEX SC`), and Global Depositary Receipts (`GOOGL-DR`, `META-DR`, `NVDA-DR`)
     let iron_cmdty_book = world.order_books.insert_with_key(|id| {
         CentralLimitOrderBook::new(
             id,
@@ -66,6 +78,40 @@ pub fn build_vertical_slice_0(
             Money::from_dollars(42),
         )
     });
+
+    let plex_sc_book = world.order_books.insert_with_key(|id| {
+        CentralLimitOrderBook::new(
+            id,
+            "PLEX SC",
+            InstrumentKind::ServiceCredit,
+            Money::from_dollars(1_000),
+        )
+    });
+
+    let googl_dr_book = register_depositary_receipt_book(
+        &mut world,
+        "GOOGL-DR EQ",
+        *b"GOOGL   ",
+        Money::from_dollars(281),
+        25,
+        10_000,
+    );
+    let meta_dr_book = register_depositary_receipt_book(
+        &mut world,
+        "META-DR EQ",
+        *b"META    ",
+        Money::from_dollars(590),
+        20,
+        10_000,
+    );
+    let nvda_dr_book = register_depositary_receipt_book(
+        &mut world,
+        "NVDA-DR EQ",
+        *b"NVDA    ",
+        Money::from_dollars(1_380),
+        10,
+        10_000,
+    );
 
     // 4. Register the 3 Household Income Cohorts
     let wage_entity = world.ledger.register_entity("Wage Earners Cohort", false);
@@ -276,6 +322,46 @@ pub fn build_vertical_slice_0(
         (wage_entity, mgr_entity, cap_entity),
     )?;
 
+    // Seed initial ServiceCredits (PLEX) to CapitalistsExecutives (500 SC) and Player Corp (10 SC)
+    let player_entity = world
+        .corporations
+        .get(player_retail_corp)
+        .map(|c| c.entity_id)
+        .ok_or(CoreError::UnknownCorporation(player_retail_corp))?;
+    world.service_credit_positions.insert(
+        cap_entity,
+        ServiceCreditPosition {
+            owned_credits: 500,
+            reserved_credits: 0,
+        },
+    );
+    world.service_credit_positions.insert(
+        player_entity,
+        ServiceCreditPosition {
+            owned_credits: 10,
+            reserved_credits: 0,
+        },
+    );
+    world.total_service_credits_supply = 510;
+
+    // Seed initial Depositary Receipt holdings (8,000 held by Sovereign Market-Maker, 2,000 held by CapitalistsExecutives)
+    for dr_book in [googl_dr_book, meta_dr_book, nvda_dr_book] {
+        world.depositary_positions.insert(
+            (dr_book, world.sovereign_entity_id),
+            EquityPosition {
+                owned_shares: 8_000,
+                reserved_shares: 0,
+            },
+        );
+        world.depositary_positions.insert(
+            (dr_book, cap_entity),
+            EquityPosition {
+                owned_shares: 2_000,
+                reserved_shares: 0,
+            },
+        );
+    }
+
     world.audit_world_invariants()?;
 
     Ok((
@@ -284,6 +370,10 @@ pub fn build_vertical_slice_0(
             iron_ore_sku,
             appliance_sku,
             iron_cmdty_book,
+            plex_sc_book,
+            googl_dr_book,
+            meta_dr_book,
+            nvda_dr_book,
             iron_corp,
             vale_corp,
             acme_corp,
@@ -295,6 +385,29 @@ pub fn build_vertical_slice_0(
             capitalist_cohort,
         },
     ))
+}
+
+fn register_depositary_receipt_book(
+    world: &mut WorldState,
+    ticker: &str,
+    symbol_code: [u8; 8],
+    initial_price: Money,
+    quarterly_dividend_bps: u32,
+    total_units: u64,
+) -> InstrumentId {
+    let inst_id = world.order_books.insert_with_key(|id| {
+        CentralLimitOrderBook::new(
+            id,
+            ticker,
+            InstrumentKind::DepositaryReceipt {
+                symbol_code,
+                quarterly_dividend_bps,
+            },
+            initial_price,
+        )
+    });
+    world.depositary_total_units.insert(inst_id, total_units);
+    inst_id
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,6 +458,17 @@ fn register_slice_corporation(
         monthly_units_output: 0,
         monthly_units_sold: 0,
         last_monthly_dividend_paid: Money::ZERO,
+        founded_tick: 0,
+        founder_entity_id: None,
+        founder_lockup_until_tick: 0,
+        founder_locked_shares: 0,
+        cloud_tier: CloudTier::Tier1PosWire,
+        subscribed_cloud_tier: CloudTier::Tier1PosWire,
+        monthly_genuine_b2c_revenue: Money::ZERO,
+        monthly_laundered_cash: Money::ZERO,
+        ransomware_degraded_until_tick: 0,
+        security_shield_until_tick: 0,
+        logistics_shield_until_tick: 0,
     });
 
     let eq_ticker = format!("{ticker} EQ");

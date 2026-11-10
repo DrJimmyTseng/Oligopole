@@ -7,6 +7,8 @@ pub enum DecisionSourceKind {
     PlayerManual = 1,
     ClefFlashSlowTick = 2,
     System0Heuristic = 3,
+    AuthorityWebhook = 4,
+    OracleFeed = 5,
 }
 
 impl DecisionSourceKind {
@@ -18,6 +20,8 @@ impl DecisionSourceKind {
         match v {
             1 => Self::PlayerManual,
             2 => Self::ClefFlashSlowTick,
+            4 => Self::AuthorityWebhook,
+            5 => Self::OracleFeed,
             _ => Self::System0Heuristic,
         }
     }

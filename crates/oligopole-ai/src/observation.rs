@@ -64,6 +64,8 @@ impl ActorObservationView {
             CorporationRole::ResourceExtractor { output_sku }
             | CorporationRole::Manufacturer { output_sku, .. } => output_sku,
             CorporationRole::Retailer { retail_sku } => retail_sku,
+            CorporationRole::LogisticsTrucking { freight_sku } => freight_sku,
+            CorporationRole::PrivateSecurity { protected_sku } => protected_sku,
         };
         let primary_inventory_units = corp.inventory_lot(primary_sku).available_qty();
 
@@ -111,6 +113,8 @@ impl ActorObservationView {
                 .map(|c| c.posted_selling_price)
                 .min()
                 .unwrap_or(Money::from_dollars(130)),
+            CorporationRole::LogisticsTrucking { .. } => Money::from_dollars(10),
+            CorporationRole::PrivateSecurity { .. } => Money::from_dollars(1_500),
         };
 
         Ok(Self {

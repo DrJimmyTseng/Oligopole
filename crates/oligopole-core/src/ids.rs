@@ -23,3 +23,15 @@ pub struct OrderId(pub u64);
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash, Serialize, Deserialize,
 )]
 pub struct ContractId(pub u64);
+
+/// Monotonically increasing deterministic identifier for a Corporate Wire (`MSG`) message.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash, Serialize, Deserialize,
+)]
+pub struct WireMessageId(pub u64);
+
+/// Monotonically increasing deterministic identifier for a Physical Share-Borrow Short Loan.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash, Serialize, Deserialize,
+)]
+pub struct ShortLoanId(pub u64);

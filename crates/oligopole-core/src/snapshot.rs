@@ -3,7 +3,8 @@ use crate::calendar::{Date360, Tick};
 use crate::clob::{InstrumentKind, OhlcvBar, OrderBookDepthLevel, TradeFill};
 use crate::household::HouseholdCohortKind;
 use crate::ids::{CohortId, CorpId, InstrumentId, SkuId};
-use crate::production::{AiDelegationConfig, CorporationRole, ExecutivePersonaKind};
+use crate::production::{AiDelegationConfig, CloudTier, CorporationRole, ExecutivePersonaKind};
+use crate::wire::{ShortPositionRecord, WireMessage};
 use oligopole_ledger::{EntityId, FinancialStatementReport, Money, WacInventoryLot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -15,6 +16,9 @@ pub struct InstrumentSnapshot {
     pub ticker: String,
     pub kind: InstrumentKind,
     pub last_price: Money,
+    pub luld_reference_price: Money,
+    pub luld_band_bps: u32,
+    pub short_interest_shares: u64,
     pub best_bid: Option<Money>,
     pub best_ask: Option<Money>,
     pub top_bids: Vec<OrderBookDepthLevel>,
@@ -36,6 +40,11 @@ pub struct CorporationSnapshot {
     pub delegation: AiDelegationConfig,
     pub cash_balance: Money,
     pub available_cash: Money,
+    pub illicit_cash_balance: Money,
+    pub tax_lien_payable: Money,
+    pub service_credits: u64,
+    pub cloud_tier: CloudTier,
+    pub subscribed_cloud_tier: CloudTier,
     pub loans_payable: Money,
     pub daily_capacity: u64,
     pub daily_wage_bill: Money,
@@ -49,6 +58,13 @@ pub struct CorporationSnapshot {
     pub share_price: Money,
     pub market_cap: Money,
     pub last_monthly_dividend_paid: Money,
+    pub founded_tick: u64,
+    pub founder_lockup_until_tick: u64,
+    pub monthly_genuine_b2c_revenue: Money,
+    pub monthly_laundered_cash: Money,
+    pub ransomware_degraded_until_tick: u64,
+    pub security_shield_until_tick: u64,
+    pub logistics_shield_until_tick: u64,
     pub inventory: BTreeMap<SkuId, WacInventoryLot>,
     pub financial_statement: FinancialStatementReport,
 }
@@ -67,7 +83,7 @@ pub struct CohortSnapshot {
 }
 
 /// Immutable, zero-lock world snapshot published via `tokio::sync::watch<Arc<WorldView>>`
-/// from the simulation thread to the 120 FPS `egui` Bloomberg Terminal thread.
+/// from the simulation thread (or authoritative Axum WebSocket stream) to the 120 FPS `egui` Bloomberg Terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldView {
     pub tick: Tick,
@@ -76,11 +92,17 @@ pub struct WorldView {
     pub bank_statement: FinancialStatementReport,
     pub bank_loan_rate_bps: u32,
     pub bank_deposit_rate_bps: u32,
+    pub sovereign_entity_id: EntityId,
+    pub sovereign_cash_balance: Money,
+    pub sovereign_dr_reserve_buffer: Money,
     pub total_m1_money_supply: Money,
     pub total_bank_loans: Money,
+    pub total_service_credits_supply: u64,
     pub corporations: Vec<CorporationSnapshot>,
     pub cohorts: Vec<CohortSnapshot>,
     pub instruments: Vec<InstrumentSnapshot>,
     pub active_b2b_contracts: Vec<B2BSupplyContract>,
+    pub wire_messages: Vec<WireMessage>,
+    pub visible_short_positions: Vec<ShortPositionRecord>,
     pub sku_codes: BTreeMap<SkuId, String>,
 }

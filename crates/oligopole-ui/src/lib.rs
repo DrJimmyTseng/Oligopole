@@ -8,7 +8,8 @@ pub mod theme;
 
 pub use app::{
     OligopoleTerminalApp, SPEED_FAST, SPEED_MAX_TURBO, SPEED_NORMAL, SPEED_PAUSED,
-    SimulationThreadHandles, launch_native_terminal, spawn_simulation_thread,
+    SimulationThreadHandles, launch_native_terminal, launch_remote_terminal,
+    spawn_remote_websocket_client, spawn_simulation_thread,
 };
 pub use channel_link::{ChannelLinkRegistry, LinkChannel};
 pub use command_bar::{ParsedTerminalCommand, TerminalMnemonic, parse_bloomberg_command};
