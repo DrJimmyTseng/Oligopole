@@ -59,6 +59,14 @@ pub struct Date360 {
     pub day: u8,
 }
 
+impl Date360 {
+    /// Returns the 1-indexed fiscal quarter (`1..=4`) for this 30/360 date.
+    #[inline]
+    pub const fn quarter(self) -> u8 {
+        ((self.month.saturating_sub(1)) / 3) + 1
+    }
+}
+
 impl fmt::Display for Date360 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Y{:02}-M{:02}-D{:02}", self.year, self.month, self.day)

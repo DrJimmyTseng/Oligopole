@@ -9,11 +9,14 @@ use crate::ids::{
     CohortId, ContractId, CorpId, InstrumentId, OrderId, ShortLoanId, SkuId, WireMessageId,
 };
 use crate::production::{
-    AiDelegationConfig, CloudTier, Corporation, CorporationRole, ExecutivePersonaKind,
-    SkuDefinition,
+    AiDelegationConfig, CloudTier, Corporation, CorporationRole, CreditRating,
+    ExecutivePersonaKind, SkuDefinition,
 };
 use crate::retail_market::compute_retail_clearing_plan;
-use crate::snapshot::{CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, WorldView};
+use crate::snapshot::{
+    CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, MacroTelemetrySnapshot, NewsCategory,
+    NewsHeadline, ShareholderRecord, WorldView,
+};
 use crate::wire::{
     CrimeOperationKind, MAX_RESOLVED_WIRE_MESSAGES_PER_CORP, ServiceCreditPosition,
     ShortPositionRecord, WireAttachment, WireAttachmentStatus, WireMessage,
@@ -26,7 +29,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use slotmap::SlotMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Maximum number of corporate & macroeconomic headlines retained in the live Bloomberg News Wire (`NEWS <GO>`).
+pub const MAX_NEWS_FEED_HEADLINES: usize = 64;
 
 /// Per-shareholder position in a corporation's common stock, tracking open Equity CLOB Ask reservations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -81,6 +87,14 @@ pub struct WorldState {
     pub wire_messages: Vec<WireMessage>,
     /// Active corporate espionage wiretaps `(Attacker CorpId, Target CorpId) -> expires_at_tick`.
     pub active_wiretaps: BTreeMap<(CorpId, CorpId), u64>,
+    /// Monotonic sequence counter for `NewsHeadline` events.
+    pub next_news_seq: u64,
+    /// Bounded ring buffer of deterministic corporate & macro headlines (`NEWS <GO>`).
+    pub news_feed: VecDeque<NewsHeadline>,
+    /// Gross trade & B2C transaction volume accumulated in the current 30-day month.
+    pub current_month_gdp_accumulator: Money,
+    /// Trailing 30-day macroeconomic transaction velocity (`GDP` proxy).
+    pub trailing_30d_gdp: Money,
 }
 
 /// Serializable wrapper for `EquityPosition`.
@@ -121,7 +135,28 @@ impl WorldState {
             tax_liens: BTreeMap::new(),
             wire_messages: Vec::new(),
             active_wiretaps: BTreeMap::new(),
+            next_news_seq: 1,
+            news_feed: VecDeque::with_capacity(MAX_NEWS_FEED_HEADLINES),
+            current_month_gdp_accumulator: Money::ZERO,
+            trailing_30d_gdp: Money::ZERO,
         }
+    }
+
+    /// Appends a deterministic headline to the bounded `news_feed` ring buffer (`MAX_NEWS_FEED_HEADLINES = 64`).
+    pub fn push_news(&mut self, ticker: &str, category: NewsCategory, headline: String) {
+        if self.news_feed.len() >= MAX_NEWS_FEED_HEADLINES {
+            self.news_feed.pop_front();
+        }
+        let seq_id = self.next_news_seq;
+        self.next_news_seq = self.next_news_seq.saturating_add(1);
+        self.news_feed.push_back(NewsHeadline {
+            seq_id,
+            tick: self.current_tick,
+            date: self.current_tick.to_date360(),
+            ticker: ticker.to_owned(),
+            category,
+            headline,
+        });
     }
 
     pub fn find_corp_by_entity(&self, entity_id: EntityId) -> Option<CorpId> {
@@ -204,25 +239,56 @@ impl WorldState {
                 corp.max_input_bid_price = new_max_bid;
             }
             PlayerCommand::RequestBankLoan { corp_id, principal } => {
-                let entity_id = self
-                    .corporations
-                    .get(corp_id)
-                    .ok_or(CoreError::UnknownCorporation(corp_id))?
-                    .entity_id;
-                self.bank
-                    .originate_loan(&mut self.ledger, tick, entity_id, principal, None)?;
+                let (entity_id, ticker, rating) = {
+                    let c = self
+                        .corporations
+                        .get(corp_id)
+                        .ok_or(CoreError::UnknownCorporation(corp_id))?;
+                    (c.entity_id, c.ticker.clone(), c.credit_rating)
+                };
+                let eff_rate = self
+                    .bank
+                    .default_loan_rate_bps
+                    .saturating_add(rating.spread_bps());
+                self.bank.originate_loan(
+                    &mut self.ledger,
+                    tick,
+                    entity_id,
+                    principal,
+                    Some(eff_rate),
+                )?;
+                self.push_news(
+                    &ticker,
+                    NewsCategory::CreditAndDebt,
+                    format!(
+                        "{ticker} draws {principal} credit facility at {}.{:02}% ({})",
+                        eff_rate / 100,
+                        eff_rate % 100,
+                        rating.badge_label()
+                    ),
+                );
             }
             PlayerCommand::RepayBankLoan { corp_id, amount } => {
-                let entity_id = self
-                    .corporations
-                    .get(corp_id)
-                    .ok_or(CoreError::UnknownCorporation(corp_id))?
-                    .entity_id;
+                let (entity_id, ticker) = {
+                    let c = self
+                        .corporations
+                        .get(corp_id)
+                        .ok_or(CoreError::UnknownCorporation(corp_id))?;
+                    (c.entity_id, c.ticker.clone())
+                };
                 let avail = self.ledger.available_cash(entity_id)?;
                 let pay = amount.min(avail);
                 if pay.is_positive() {
-                    self.bank
+                    let repaid = self
+                        .bank
                         .repay_loan_principal(&mut self.ledger, tick, entity_id, pay)?;
+                    if repaid.is_positive() {
+                        self.push_news(
+                            &ticker,
+                            NewsCategory::CreditAndDebt,
+                            format!("{ticker} retires {repaid} senior bank debt"),
+                        );
+                    }
                 }
             }
             PlayerCommand::ExpandFacilityCapacity {
@@ -352,6 +418,14 @@ impl WorldState {
             } => {
                 self.execute_respond_wire_attachment(responder_corp_id, message_id, accept)?;
             }
+            PlayerCommand::ExecuteFacilityMaintenance { corp_id } => {
+                self.execute_maintenance_and_rd_overhaul(
+                    corp_id,
+                    Money::from_dollars(18_000),
+                    1_500,
+                    200,
+                )?;
+            }
         }
         Ok(())
     }
@@ -374,11 +448,15 @@ impl WorldState {
                 .loans
                 .get(&corp.entity_id)
                 .map_or(Money::ZERO, |l| l.principal_outstanding);
+            let eff_rate = self
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(corp.credit_rating.spread_bps());
             let reconciled = reconcile_strategic_directive(
                 corp,
                 avail_cash,
                 debt,
-                self.bank.default_loan_rate_bps,
+                eff_rate,
                 raw_directive,
             )?;
             (corp.entity_id, avail_cash, debt, reconciled)
@@ -473,6 +551,19 @@ impl WorldState {
             } => {
                 self.execute_equity_issuance(corp_id, *shares_to_issue, *min_ask_price)?;
             }
+            JointCapitalAction::MaintenanceAndRdOverhaul {
+                overhaul_cost,
+                condition_restore_bps,
+                quality_boost_bps,
+                ..
+            } => {
+                self.execute_maintenance_and_rd_overhaul(
+                    corp_id,
+                    *overhaul_cost,
+                    *condition_restore_bps,
+                    *quality_boost_bps,
+                )?;
+            }
         }
 
         // 2. Apply pricing, wage, and dividend policy dials with role-specific competitive reference band clamping
@@ -540,15 +631,26 @@ impl WorldState {
         loan_principal: Money,
     ) -> Result<(), CoreError> {
         let tick = self.current_tick.0;
-        let entity_id = self
-            .corporations
-            .get(corp_id)
-            .ok_or(CoreError::UnknownCorporation(corp_id))?
-            .entity_id;
+        let (entity_id, ticker, rating) = {
+            let c = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            (c.entity_id, c.ticker.clone(), c.credit_rating)
+        };
 
         if loan_principal.is_positive() {
-            self.bank
-                .originate_loan(&mut self.ledger, tick, entity_id, loan_principal, None)?;
+            let eff_rate = self
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(rating.spread_bps());
+            self.bank.originate_loan(
+                &mut self.ledger,
+                tick,
+                entity_id,
+                loan_principal,
+                Some(eff_rate),
+            )?;
         }
 
         let avail = self.ledger.available_cash(entity_id)?;
@@ -591,9 +693,104 @@ impl WorldState {
                 self.ledger.post_entry(&entry)?;
             }
 
+            let mut new_cap = 0;
             if let Some(corp) = self.corporations.get_mut(corp_id) {
                 corp.daily_capacity = corp.daily_capacity.saturating_add(added_capacity);
+                corp.facility_condition_bps = corp
+                    .facility_condition_bps
+                    .saturating_add(400)
+                    .min(10_000);
+                new_cap = corp.daily_capacity;
             }
+            self.push_news(
+                &ticker,
+                NewsCategory::CapExAndExpansion,
+                format!(
+                    "{ticker} commissions +{added_capacity}/d plant expansion ({capex_cost} CapEx -> {new_cap}/d total)"
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn execute_maintenance_and_rd_overhaul(
+        &mut self,
+        corp_id: CorpId,
+        overhaul_cost: Money,
+        condition_restore_bps: u32,
+        quality_boost_bps: u32,
+    ) -> Result<(), CoreError> {
+        let tick = self.current_tick.0;
+        let (entity_id, ticker) = {
+            let c = self
+                .corporations
+                .get(corp_id)
+                .ok_or(CoreError::UnknownCorporation(corp_id))?;
+            (c.entity_id, c.ticker.clone())
+        };
+
+        let avail = self.ledger.available_cash(entity_id)?;
+        if overhaul_cost.is_positive() && avail >= overhaul_cost {
+            if let Some((wage_ent, mgr_ent)) = self.wage_and_manager_entities() {
+                let wage_half = Money::from_cents(overhaul_cost.cents() / 2);
+                let mgr_half = overhaul_cost.checked_sub(wage_half)?;
+
+                let firm_dep = self.ledger.entity_account_id(
+                    entity_id,
+                    StandardAccountCode::DepreciationExpense,
+                )?;
+                let firm_cash = self
+                    .ledger
+                    .entity_account_id(entity_id, StandardAccountCode::CashAndDeposits)?;
+                let w_cash = self
+                    .ledger
+                    .entity_account_id(wage_ent, StandardAccountCode::CashAndDeposits)?;
+                let w_rev = self
+                    .ledger
+                    .entity_account_id(wage_ent, StandardAccountCode::SalesRevenue)?;
+                let m_cash = self
+                    .ledger
+                    .entity_account_id(mgr_ent, StandardAccountCode::CashAndDeposits)?;
+                let m_rev = self
+                    .ledger
+                    .entity_account_id(mgr_ent, StandardAccountCode::SalesRevenue)?;
+
+                let mut entry = JournalEntry::new(tick, "Plant Maintenance & R&D Overhaul")
+                    .debit(firm_dep, overhaul_cost)
+                    .credit(firm_cash, overhaul_cost);
+                if wage_half.is_positive() {
+                    entry = entry.debit(w_cash, wage_half).credit(w_rev, wage_half);
+                }
+                if mgr_half.is_positive() {
+                    entry = entry.debit(m_cash, mgr_half).credit(m_rev, mgr_half);
+                }
+                self.ledger.post_entry(&entry)?;
+            }
+
+            let mut new_cond = 10_000;
+            let mut new_qual = 10_000;
+            if let Some(corp) = self.corporations.get_mut(corp_id) {
+                corp.facility_condition_bps = corp
+                    .facility_condition_bps
+                    .saturating_add(condition_restore_bps)
+                    .min(10_000);
+                corp.quality_score_bps = corp
+                    .quality_score_bps
+                    .saturating_add(quality_boost_bps)
+                    .min(20_000);
+                new_cond = corp.facility_condition_bps;
+                new_qual = corp.quality_score_bps;
+            }
+            self.push_news(
+                &ticker,
+                NewsCategory::RdAndMaintenance,
+                format!(
+                    "{ticker} completes {overhaul_cost} R&D & plant overhaul (Condition {}.{:01}%, Quality {} bps)",
+                    new_cond / 100,
+                    (new_cond % 100) / 10,
+                    new_qual
+                ),
+            );
         }
         Ok(())
     }
@@ -679,7 +876,11 @@ impl WorldState {
                     .loans
                     .get(&entity_id)
                     .map_or(Money::ZERO, |l| l.principal_outstanding);
-                c.working_capital_floor(45, debt, self.bank.default_loan_rate_bps)?
+                let eff_rate = self
+                    .bank
+                    .default_loan_rate_bps
+                    .saturating_add(c.credit_rating.spread_bps());
+                c.working_capital_floor(45, debt, eff_rate)?
             }
             None => Money::ZERO,
         };
@@ -1095,6 +1296,9 @@ impl WorldState {
                 }
 
                 self.ledger.post_entry(&entry)?;
+                self.current_month_gdp_accumulator = self
+                    .current_month_gdp_accumulator
+                    .checked_add(trade_notional)?;
             }
             InstrumentKind::Equity { corp_id } => {
                 // Secondary market equity transfer (or corporate share buyback / primary issuance):
@@ -1119,11 +1323,25 @@ impl WorldState {
 
                 if issuer_entity_id == Some(fill.buyer_entity_id) {
                     // Corporate Share Buyback: the issuing corporation purchased its own shares and immediately retires them!
+                    let mut retired_ticker = None;
+                    let mut new_total_shares = 0;
                     if let Some(corp) = self.corporations.get_mut(corp_id) {
                         corp.total_shares_outstanding = corp
                             .total_shares_outstanding
                             .saturating_sub(fill.qty)
                             .max(1);
+                        retired_ticker = Some(corp.ticker.clone());
+                        new_total_shares = corp.total_shares_outstanding;
+                    }
+                    if let Some(tkr) = retired_ticker {
+                        self.push_news(
+                            &tkr,
+                            NewsCategory::DividendAndBuyback,
+                            format!(
+                                "{tkr} repurchases & retires {} shares at {} ({new_total_shares} shares out)",
+                                fill.qty, fill.execution_price
+                            ),
+                        );
                     }
                 } else {
                     let buyer_pos = self
@@ -1174,6 +1392,9 @@ impl WorldState {
                         .credit(sov_rev, sovereign_rake);
                 }
                 self.ledger.post_entry(&entry)?;
+                self.current_month_gdp_accumulator = self
+                    .current_month_gdp_accumulator
+                    .checked_add(trade_notional)?;
             }
             InstrumentKind::DepositaryReceipt { .. } => {
                 let seller_pos = self
@@ -1236,6 +1457,9 @@ impl WorldState {
                         .credit(sov_rev, sovereign_rake);
                 }
                 self.ledger.post_entry(&entry)?;
+                self.current_month_gdp_accumulator = self
+                    .current_month_gdp_accumulator
+                    .checked_add(trade_notional)?;
             }
             InstrumentKind::ServiceCredit => {
                 let seller_pos = self
@@ -1297,6 +1521,9 @@ impl WorldState {
                         .credit(sov_rev, sovereign_rake);
                 }
                 self.ledger.post_entry(&entry)?;
+                self.current_month_gdp_accumulator = self
+                    .current_month_gdp_accumulator
+                    .checked_add(trade_notional)?;
             }
         }
 
@@ -1324,6 +1551,7 @@ impl WorldState {
         self.occ_version = self.occ_version.saturating_add(1);
 
         if (next_tick.0 - 1).is_multiple_of(30) {
+            self.current_month_gdp_accumulator = Money::ZERO;
             for (_, corp) in &mut self.corporations {
                 corp.monthly_units_output = 0;
                 corp.monthly_units_sold = 0;
@@ -1541,8 +1769,11 @@ impl WorldState {
                 .loans
                 .get(&buyer.entity_id)
                 .map_or(Money::ZERO, |l| l.principal_outstanding);
-            let floor =
-                buyer.working_capital_floor(20, debt, self.bank.default_loan_rate_bps)?;
+            let eff_rate = self
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(buyer.credit_rating.spread_bps());
+            let floor = buyer.working_capital_floor(20, debt, eff_rate)?;
             (buyer.entity_id, floor)
         };
 
@@ -1608,6 +1839,9 @@ impl WorldState {
         }
 
         self.ledger.post_entry(&entry)?;
+        self.current_month_gdp_accumulator = self
+            .current_month_gdp_accumulator
+            .checked_add(trade_notional)?;
         Ok(actual_qty)
     }
 
@@ -1627,7 +1861,7 @@ impl WorldState {
                 (
                     corp.entity_id,
                     corp.role,
-                    corp.daily_capacity,
+                    corp.effective_daily_capacity(),
                     corp.daily_wage_bill,
                     corp.ransomware_degraded_until_tick,
                 )
@@ -1688,6 +1922,10 @@ impl WorldState {
                                 .record_addition(daily_capacity, daily_wage_bill)?;
                             corp.monthly_units_output =
                                 corp.monthly_units_output.saturating_add(daily_capacity);
+                            corp.facility_condition_bps = corp
+                                .facility_condition_bps
+                                .saturating_sub(3)
+                                .max(3_500);
                         }
                     }
                 }
@@ -1731,6 +1969,10 @@ impl WorldState {
                         if let Some(corp) = self.corporations.get_mut(corp_id) {
                             corp.monthly_units_output =
                                 corp.monthly_units_output.saturating_add(output_produced);
+                            corp.facility_condition_bps = corp
+                                .facility_condition_bps
+                                .saturating_sub(3)
+                                .max(3_500);
                         }
 
                         let in_code = self
@@ -1876,11 +2118,13 @@ impl WorldState {
                                 .get(&entity_id)
                                 .map_or(Money::ZERO, |l| l.principal_outstanding);
                             let working_floor = match self.corporations.get(corp_id) {
-                                Some(c) => c.working_capital_floor(
-                                    20,
-                                    debt,
-                                    self.bank.default_loan_rate_bps,
-                                )?,
+                                Some(c) => {
+                                    let eff_rate = self
+                                        .bank
+                                        .default_loan_rate_bps
+                                        .saturating_add(c.credit_rating.spread_bps());
+                                    c.working_capital_floor(20, debt, eff_rate)?
+                                }
                                 None => Money::ZERO,
                             };
                             let free_cash = if avail_cash > working_floor {
@@ -1941,9 +2185,9 @@ impl WorldState {
         )?;
 
         let book_value_cents = (report.total_equity_including_net_income.cents() / shares).max(100);
-        // Include physical productive capacity replacement value ($6,500 per daily capacity unit) in intrinsic asset backing
+        // Include physical productive capacity replacement value ($6,500 per daily capacity unit, scaled by facility condition) in intrinsic asset backing
         let capacity_value_cents =
-            (i128::from(corp.daily_capacity) * 650_000) / shares;
+            (i128::from(corp.effective_daily_capacity()) * 650_000) / shares;
         let intrinsic_asset_cents = book_value_cents.saturating_add(capacity_value_cents);
 
         let quarter_days = i128::from(((self.current_tick.0.saturating_sub(1)) % 90) + 1);
@@ -2365,7 +2609,14 @@ impl WorldState {
                     seller.monthly_genuine_b2c_revenue = seller
                         .monthly_genuine_b2c_revenue
                         .checked_add(settlement.gross_revenue)?;
+                    seller.facility_condition_bps = seller
+                        .facility_condition_bps
+                        .saturating_sub(1)
+                        .max(3_500);
                 }
+                self.current_month_gdp_accumulator = self
+                    .current_month_gdp_accumulator
+                    .checked_add(settlement.gross_revenue)?;
 
                 let h_exp = self
                     .ledger
@@ -2521,14 +2772,16 @@ impl WorldState {
 
         self.accrue_daily_short_borrow_fees(tick)?;
 
-        // 5C. Monthly SovereignCloud Billing, Dividend Distribution, Bank & Sovereign Fiscal Recycling (at Day 30)
+        // 5C. Monthly SovereignCloud Billing, Dividend Distribution, Bank & Sovereign Fiscal Recycling & Credit Rating Review (at Day 30)
         if self.current_tick.is_month_end() {
+            self.trailing_30d_gdp = self.current_month_gdp_accumulator;
             self.bill_monthly_sovereign_cloud(tick)?;
             self.recycle_monthly_bank_net_income(tick)?;
             self.recycle_monthly_sovereign_surplus(tick)?;
             for &corp_id in &corp_ids {
                 self.distribute_monthly_dividend(tick, corp_id)?;
             }
+            self.update_monthly_credit_ratings(tick)?;
         }
 
         // 5D. Quarterly Depositary Dividends & Income Statement Closing into Retained Earnings (every 90 ticks)
@@ -2540,9 +2793,25 @@ impl WorldState {
             self.ledger
                 .close_income_statement_for_entity(tick, self.sovereign_entity_id)?;
             for &corp_id in &corp_ids {
-                if let Some(c) = self.corporations.get(corp_id) {
+                if let Some((entity_id, ticker)) = self
+                    .corporations
+                    .get(corp_id)
+                    .map(|c| (c.entity_id, c.ticker.clone()))
+                {
+                    let q_report =
+                        FinancialStatementReport::generate(&self.ledger, entity_id, tick)?;
+                    self.push_news(
+                        &ticker,
+                        NewsCategory::QuarterlyEarnings,
+                        format!(
+                            "{ticker} reports Q{} earnings: Net Income {}, Equity {}",
+                            self.current_tick.to_date360().quarter(),
+                            q_report.net_income,
+                            q_report.total_equity_including_net_income
+                        ),
+                    );
                     self.ledger
-                        .close_income_statement_for_entity(tick, c.entity_id)?;
+                        .close_income_statement_for_entity(tick, entity_id)?;
                 }
             }
             for (_, cohort) in &self.cohorts {
@@ -2650,7 +2919,7 @@ impl WorldState {
     }
 
     fn distribute_monthly_dividend(&mut self, tick: u64, corp_id: CorpId) -> Result<(), CoreError> {
-        let (entity_id, payout_bps, working_floor, idle_cash_ceiling, total_shares) = {
+        let (entity_id, ticker, payout_bps, working_floor, idle_cash_ceiling, total_shares) = {
             let Some(c) = self.corporations.get(corp_id) else {
                 return Ok(());
             };
@@ -2659,12 +2928,15 @@ impl WorldState {
                 .loans
                 .get(&c.entity_id)
                 .map_or(Money::ZERO, |l| l.principal_outstanding);
-            let floor =
-                c.working_capital_floor(20, debt, self.bank.default_loan_rate_bps)?;
-            let ceiling =
-                c.working_capital_floor(180, debt, self.bank.default_loan_rate_bps)?;
+            let eff_rate = self
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(c.credit_rating.spread_bps());
+            let floor = c.working_capital_floor(20, debt, eff_rate)?;
+            let ceiling = c.working_capital_floor(180, debt, eff_rate)?;
             (
                 c.entity_id,
+                c.ticker.clone(),
                 c.target_dividend_payout_bps,
                 floor,
                 ceiling,
@@ -2763,6 +3035,16 @@ impl WorldState {
 
         self.ledger.post_entry(&entry)?;
 
+        if total_dividend >= Money::from_dollars(10_000) {
+            self.push_news(
+                &ticker,
+                NewsCategory::DividendAndBuyback,
+                format!(
+                    "{ticker} distributes {total_dividend} monthly cash dividend to shareholders"
+                ),
+            );
+        }
+
         // Guard #2: Collect Payment-in-Lieu-of-Dividend (PIL) from open `ShortPositionRecord`s on `corp_id`
         let open_shorts: Vec<ShortLoanId> = self
             .short_positions
@@ -2826,6 +3108,74 @@ impl WorldState {
             }
         }
 
+        Ok(())
+    }
+
+    fn update_monthly_credit_ratings(&mut self, tick: u64) -> Result<(), CoreError> {
+        let corp_ids: Vec<CorpId> = self.corporations.keys().collect();
+        for corp_id in corp_ids {
+            let (entity_id, ticker, old_rating, debt, floor_20d) = {
+                let Some(c) = self.corporations.get(corp_id) else {
+                    continue;
+                };
+                let debt = self
+                    .bank
+                    .loans
+                    .get(&c.entity_id)
+                    .map_or(Money::ZERO, |l| l.principal_outstanding);
+                let eff_rate = self
+                    .bank
+                    .default_loan_rate_bps
+                    .saturating_add(c.credit_rating.spread_bps());
+                let floor = c.working_capital_floor(20, debt, eff_rate)?;
+                (
+                    c.entity_id,
+                    c.ticker.clone(),
+                    c.credit_rating,
+                    debt,
+                    floor,
+                )
+            };
+
+            let avail_cash = self.ledger.available_cash(entity_id)?;
+            let report = FinancialStatementReport::generate(&self.ledger, entity_id, tick)?;
+            let new_rating = CreditRating::evaluate(
+                avail_cash,
+                floor_20d,
+                debt,
+                report.total_equity_including_net_income,
+            );
+
+            if let Some(c) = self.corporations.get_mut(corp_id) {
+                c.credit_rating = new_rating;
+            }
+            let new_rate = self
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(new_rating.spread_bps());
+            if let Some(loan) = self.bank.loans.get_mut(&entity_id) {
+                loan.annual_rate_bps = new_rate;
+            }
+
+            if new_rating != old_rating {
+                let verb = if new_rating < old_rating {
+                    "UPGRADED"
+                } else {
+                    "DOWNGRADED"
+                };
+                self.push_news(
+                    &ticker,
+                    NewsCategory::CreditAndDebt,
+                    format!(
+                        "Credit Rating {verb}: {ticker} {} -> {} (Borrow Rate {}.{:02}%)",
+                        old_rating.badge_label(),
+                        new_rating.badge_label(),
+                        new_rate / 100,
+                        new_rate % 100
+                    ),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2998,6 +3348,8 @@ impl WorldState {
             ransomware_degraded_until_tick: 0,
             security_shield_until_tick: 0,
             logistics_shield_until_tick: 0,
+            facility_condition_bps: 10_000,
+            credit_rating: CreditRating::AAA,
             inventory: BTreeMap::new(),
         });
 
@@ -4578,6 +4930,48 @@ impl WorldState {
             let market_cap = share_price.checked_mul_u64(corp.total_shares_outstanding)?;
             let financial_statement =
                 FinancialStatementReport::generate(&self.ledger, corp.entity_id, tick.0)?;
+            let effective_loan_rate_bps = self
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(corp.credit_rating.spread_bps());
+
+            let total_shares = corp.total_shares_outstanding.max(1);
+            let mut cap_table: Vec<ShareholderRecord> = self
+                .equity_positions
+                .iter()
+                .filter_map(|(&(cid, holder_id), pos)| {
+                    if cid == corp.corp_id && pos.owned_shares > 0 {
+                        let holder_name = self
+                            .ledger
+                            .entity(holder_id)
+                            .map_or_else(|_| "Shareholder".to_owned(), |e| e.name.clone());
+                        let ownership_bps = u32::try_from(
+                            (u128::from(pos.owned_shares) * 10_000) / u128::from(total_shares),
+                        )
+                        .unwrap_or(0);
+                        Some(ShareholderRecord {
+                            holder_entity_id: holder_id,
+                            holder_name,
+                            owned_shares: pos.owned_shares,
+                            reserved_shares: pos.reserved_shares,
+                            ownership_bps,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            cap_table.sort_by(|a, b| {
+                b.owned_shares
+                    .cmp(&a.owned_shares)
+                    .then_with(|| a.holder_entity_id.cmp(&b.holder_entity_id))
+            });
+
+            let eff_cap = if corp.ransomware_degraded_until_tick > tick.0 {
+                ((corp.effective_daily_capacity().saturating_mul(60)) / 100).max(1)
+            } else {
+                corp.effective_daily_capacity()
+            };
 
             corporations.push(CorporationSnapshot {
                 corp_id: corp.corp_id,
@@ -4595,8 +4989,12 @@ impl WorldState {
                 service_credits,
                 cloud_tier: corp.cloud_tier,
                 subscribed_cloud_tier: corp.subscribed_cloud_tier,
+                credit_rating: corp.credit_rating,
+                effective_loan_rate_bps,
                 loans_payable,
                 daily_capacity: corp.daily_capacity,
+                effective_daily_capacity: eff_cap,
+                facility_condition_bps: corp.facility_condition_bps,
                 daily_wage_bill: corp.daily_wage_bill,
                 daily_manager_bill: corp.daily_manager_bill,
                 posted_selling_price: corp.posted_selling_price,
@@ -4619,6 +5017,7 @@ impl WorldState {
                 ransomware_degraded_until_tick: corp.ransomware_degraded_until_tick,
                 security_shield_until_tick: corp.security_shield_until_tick,
                 logistics_shield_until_tick: corp.logistics_shield_until_tick,
+                cap_table,
                 inventory: corp.inventory.clone(),
                 financial_statement,
             });
@@ -4668,6 +5067,8 @@ impl WorldState {
             sku_codes.insert(sku_id, sku.code.clone());
         }
 
+        let macro_telemetry = self.compute_macro_telemetry(&corporations);
+
         Ok(WorldView {
             tick,
             date: tick.to_date360(),
@@ -4681,14 +5082,100 @@ impl WorldState {
             total_m1_money_supply: total_m1,
             total_bank_loans: total_loans,
             total_service_credits_supply: self.total_service_credits_supply,
+            macro_telemetry,
             corporations,
             cohorts,
             instruments,
             active_b2b_contracts: self.b2b_contracts.clone(),
             wire_messages,
             visible_short_positions,
+            news_feed: self.news_feed.iter().cloned().collect(),
             sku_codes,
         })
+    }
+
+    fn compute_macro_telemetry(
+        &self,
+        corporations: &[CorporationSnapshot],
+    ) -> MacroTelemetrySnapshot {
+        let mut retail_cpi_sum = 0i128;
+        let mut retail_count = 0i128;
+        let mut cond_sum = 0u64;
+        let mut qual_sum = 0u64;
+
+        for c in corporations {
+            cond_sum = cond_sum.saturating_add(u64::from(c.facility_condition_bps));
+            qual_sum = qual_sum.saturating_add(u64::from(c.quality_score_bps));
+            if let CorporationRole::Retailer { retail_sku } = c.role {
+                let ref_px = self
+                    .skus
+                    .get(retail_sku)
+                    .map_or(22_000, |s| s.base_reference_price.cents().max(1));
+                retail_cpi_sum += (c.posted_selling_price.cents() * 10_000) / ref_px;
+                retail_count += 1;
+            }
+        }
+
+        let retail_cpi_index_bps = if retail_count > 0 {
+            u32::try_from((retail_cpi_sum / retail_count).clamp(1_000, 50_000)).unwrap_or(10_000)
+        } else {
+            10_000
+        };
+        let total_corps = u64::try_from(corporations.len().max(1)).unwrap_or(1);
+        let avg_facility_condition_bps = u32::try_from(cond_sum / total_corps).unwrap_or(10_000);
+        let avg_quality_score_bps = u32::try_from(qual_sum / total_corps).unwrap_or(10_000);
+
+        let extractor_hhi = Self::compute_sector_hhi(corporations, |r| {
+            matches!(r, CorporationRole::ResourceExtractor { .. })
+        });
+        let manufacturer_hhi = Self::compute_sector_hhi(corporations, |r| {
+            matches!(r, CorporationRole::Manufacturer { .. })
+        });
+        let retail_hhi = Self::compute_sector_hhi(corporations, |r| {
+            matches!(r, CorporationRole::Retailer { .. })
+        });
+
+        let gdp = if self.trailing_30d_gdp.is_positive() {
+            self.trailing_30d_gdp
+        } else {
+            self.current_month_gdp_accumulator
+        };
+
+        MacroTelemetrySnapshot {
+            retail_cpi_index_bps,
+            trailing_30d_gdp: gdp,
+            avg_facility_condition_bps,
+            avg_quality_score_bps,
+            extractor_hhi,
+            manufacturer_hhi,
+            retail_hhi,
+        }
+    }
+
+    fn compute_sector_hhi<F>(corporations: &[CorporationSnapshot], filter: F) -> u32
+    where
+        F: Fn(CorporationRole) -> bool,
+    {
+        let weights: Vec<u128> = corporations
+            .iter()
+            .filter(|c| filter(c.role))
+            .map(|c| {
+                let rev = u128::try_from(c.financial_statement.total_revenue.cents().max(0))
+                    .unwrap_or(0);
+                let cap = u128::from(c.effective_daily_capacity.max(1)) * 1_000;
+                rev.saturating_add(cap)
+            })
+            .collect();
+        let sum_w: u128 = weights.iter().copied().sum();
+        if sum_w == 0 {
+            return 0;
+        }
+        let mut hhi = 0u128;
+        for w in weights {
+            let pct = (w * 100) / sum_w;
+            hhi = hhi.saturating_add(pct * pct);
+        }
+        u32::try_from(hhi.min(10_000)).unwrap_or(10_000)
     }
 
     /// Builds a lightweight `ClobDeltaEvent` for an `InstrumentId` after an intraday order action.

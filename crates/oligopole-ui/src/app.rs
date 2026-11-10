@@ -105,7 +105,7 @@ impl OligopoleTerminalApp {
             registry: ChannelLinkRegistry::default(),
             command_input: String::from("PLYR EQ FA"),
             command_status: String::from(
-                "READY • Keys: `/` or `Ctrl+K` Command Bar | `Space` Pause | `F1-F7` Panes (`F7` = MSG Wire) | `Ctrl+S` Save Checkpoint",
+                "READY • Keys: `/` or `Ctrl+K` Command Bar | `Space` Pause | `F1-F10` Panes (MM/GP/OB/FA/OPS/EX/MSG/ECO/CAP/NEWS) | `Ctrl+S` Save",
             ),
             view_rx,
             latest_view,
@@ -159,9 +159,27 @@ impl OligopoleTerminalApp {
             LinkChannel::ChannelA,
             "PLYR",
         ));
+        let p_eco = tiles.insert_pane(TerminalPane::new(
+            TerminalMnemonic::MacroEconomy,
+            LinkChannel::ChannelA,
+            "PLYR",
+        ));
+        let p_cap = tiles.insert_pane(TerminalPane::new(
+            TerminalMnemonic::CapTable,
+            LinkChannel::ChannelA,
+            "PLYR",
+        ));
+        let p_news = tiles.insert_pane(TerminalPane::new(
+            TerminalMnemonic::NewsWire,
+            LinkChannel::ChannelA,
+            "PLYR",
+        ));
 
-        let top_row = tiles.insert_horizontal_tile(vec![p_monitor, p_chart, p_book]);
-        let bottom_row = tiles.insert_horizontal_tile(vec![p_fin, p_dag, p_exec, p_wire]);
+        let top_left = tiles.insert_tab_tile(vec![p_monitor, p_eco]);
+        let top_row = tiles.insert_horizontal_tile(vec![top_left, p_chart, p_book]);
+        let bot_left = tiles.insert_tab_tile(vec![p_fin, p_cap]);
+        let bot_mid = tiles.insert_tab_tile(vec![p_dag, p_news]);
+        let bottom_row = tiles.insert_horizontal_tile(vec![bot_left, bot_mid, p_exec, p_wire]);
         let root = tiles.insert_vertical_tile(vec![top_row, bottom_row]);
 
         Tree::new("oligopole_bloomberg_workspace", root, tiles)
@@ -261,7 +279,7 @@ impl OligopoleTerminalApp {
             }
         }
 
-        // `F1–F7` institutional function keys route directly to the 7 Bloomberg panes
+        // `F1–F10` institutional function keys route directly to the 10 Bloomberg panes
         for (key, mnemonic) in [
             (egui::Key::F1, TerminalMnemonic::MarketMonitor),
             (egui::Key::F2, TerminalMnemonic::GraphPrice),
@@ -270,6 +288,9 @@ impl OligopoleTerminalApp {
             (egui::Key::F5, TerminalMnemonic::OperationsDag),
             (egui::Key::F6, TerminalMnemonic::ExecutiveTicket),
             (egui::Key::F7, TerminalMnemonic::CorporateWire),
+            (egui::Key::F8, TerminalMnemonic::MacroEconomy),
+            (egui::Key::F9, TerminalMnemonic::CapTable),
+            (egui::Key::F10, TerminalMnemonic::NewsWire),
         ] {
             if ctx.input(|i| i.key_pressed(key)) {
                 self.route_to_pane(mnemonic, None);
@@ -359,9 +380,11 @@ impl eframe::App for OligopoleTerminalApp {
                 ui.separator();
                 ui.label(
                     RichText::new(format!(
-                        "M1: {} | Loans: {} | Sov Reserve: {} | SC Supply: {}",
+                        "M1: {} | Loans: {} | CPI: {:.2} | 30D GDP: {} | Sov Reserve: {} | SC: {}",
                         self.latest_view.total_m1_money_supply,
                         self.latest_view.total_bank_loans,
+                        f64::from(self.latest_view.macro_telemetry.retail_cpi_index_bps) / 100.0,
+                        self.latest_view.macro_telemetry.trailing_30d_gdp,
                         self.latest_view.sovereign_cash_balance,
                         self.latest_view.total_service_credits_supply
                     ))
@@ -826,6 +849,19 @@ mod tests {
         // 3. Direct F-key routing (`route_to_pane`) preserves channel ticker
         app.route_to_pane(TerminalMnemonic::ExecutiveTicket, None);
         assert!(app.command_status.contains("ROUTED [CH-A] -> ACME (EX)"));
+
+        // 4. Route to Milestone 9 mnemonics (`ECO`, `CAP`, `NEWS`)
+        app.command_input = "ECO".to_owned();
+        app.execute_command_bar();
+        assert!(app.command_status.contains("ROUTED [CH-A] -> PLYR (ECO)"));
+
+        app.command_input = "ZENI CAP".to_owned();
+        app.execute_command_bar();
+        assert!(app.command_status.contains("ROUTED [CH-A] -> ZENI (CAP)"));
+
+        app.command_input = "NEWS".to_owned();
+        app.execute_command_bar();
+        assert!(app.command_status.contains("ROUTED [CH-A] -> PLYR (NEWS)"));
     }
 
     #[test]

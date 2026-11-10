@@ -1,5 +1,5 @@
 use crate::error::AiError;
-use oligopole_core::{CorpId, CorporationRole, Tick, WorldState};
+use oligopole_core::{CorpId, CorporationRole, CreditRating, Tick, WorldState};
 use oligopole_ledger::{FinancialStatementReport, Money, StandardAccountCode};
 use serde::{Deserialize, Serialize};
 
@@ -16,10 +16,12 @@ pub struct ActorObservationView {
     pub corp_id: CorpId,
     pub ticker: String,
     pub role: CorporationRole,
+    pub credit_rating: CreditRating,
     pub available_cash: Money,
     pub outstanding_debt: Money,
     pub net_income: Money,
     pub daily_capacity: u64,
+    pub facility_condition_bps: u32,
     pub daily_wage_bill: Money,
     pub daily_manager_bill: Money,
     pub posted_selling_price: Money,
@@ -122,10 +124,12 @@ impl ActorObservationView {
             corp_id,
             ticker: corp.ticker.clone(),
             role: corp.role,
+            credit_rating: corp.credit_rating,
             available_cash,
             outstanding_debt,
             net_income: report.net_income,
             daily_capacity: corp.daily_capacity,
+            facility_condition_bps: corp.facility_condition_bps,
             daily_wage_bill: corp.daily_wage_bill,
             daily_manager_bill: corp.daily_manager_bill,
             posted_selling_price: corp.posted_selling_price,
@@ -137,7 +141,10 @@ impl ActorObservationView {
             monthly_units_sold: corp.monthly_units_sold,
             competitor_average_price,
             input_market_price,
-            bank_loan_rate_bps: world.bank.default_loan_rate_bps,
+            bank_loan_rate_bps: world
+                .bank
+                .default_loan_rate_bps
+                .saturating_add(corp.credit_rating.spread_bps()),
             share_price,
             total_shares_outstanding: corp.total_shares_outstanding,
             book_value_per_share,
@@ -147,14 +154,16 @@ impl ActorObservationView {
     /// Formats a compact, deterministic text dossier for `Clef-Flash` 9B single-pass prefill.
     pub fn to_clef_dossier(&self) -> String {
         format!(
-            "TICK={} CORP={} ROLE={:?} CASH={} DEBT={} NET_INC={} CAP={} INV={} OUT_30D={} SOLD_30D={} PRICE={} PEER_PRICE={} IN_COST={} LOAN_BPS={} SHARE_PX={} BVPS={} SHARES={}",
+            "TICK={} CORP={} ROLE={:?} RATING={} CASH={} DEBT={} NET_INC={} CAP={} COND_BPS={} INV={} OUT_30D={} SOLD_30D={} PRICE={} PEER_PRICE={} IN_COST={} LOAN_BPS={} SHARE_PX={} BVPS={} SHARES={}",
             self.tick.0,
             self.ticker,
             self.role,
+            self.credit_rating.badge_label(),
             self.available_cash,
             self.outstanding_debt,
             self.net_income,
             self.daily_capacity,
+            self.facility_condition_bps,
             self.primary_inventory_units,
             self.monthly_units_output,
             self.monthly_units_sold,

@@ -82,6 +82,21 @@ pub fn generate_joint_action_candidates(
         Money::from_dollars(-50_000)
     };
 
+    let overhaul_cost = Money::from_dollars(18_000);
+    let cond_deficit_bps = 10_000u32.saturating_sub(obs.facility_condition_bps);
+    let restored_units = ((obs.daily_capacity * u64::from(cond_deficit_bps.min(1_500))) / 10_000)
+        .max(u64::from(cond_deficit_bps >= 500));
+    let overhaul_gross_180d = unit_margin
+        .checked_mul_u64(restored_units)?
+        .checked_mul_u64(180)?;
+    let npv_overhaul = if cond_deficit_bps >= 400 && free_cash >= overhaul_cost {
+        overhaul_gross_180d
+            .checked_add(Money::from_dollars(8_000))?
+            .checked_sub(overhaul_cost)?
+    } else {
+        Money::from_dollars(-25_000)
+    };
+
     let candidates = vec![
         CandidateOption {
             label: "HOLD_AND_DELEVER".to_owned(),
@@ -136,6 +151,18 @@ pub fn generate_joint_action_candidates(
             estimated_npv: buyback_npv,
             risk_weight: dec!(-0.2),
             leverage_weight: dec!(-0.4),
+        },
+        CandidateOption {
+            label: "MAINTENANCE_RD_OVERHAUL".to_owned(),
+            action: JointCapitalAction::MaintenanceAndRdOverhaul {
+                overhaul_cost,
+                condition_restore_bps: 1_500,
+                quality_boost_bps: 200,
+                estimated_npv: npv_overhaul,
+            },
+            estimated_npv: npv_overhaul,
+            risk_weight: dec!(0.1),
+            leverage_weight: dec!(-0.3),
         },
     ];
 

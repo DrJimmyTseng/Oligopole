@@ -125,6 +125,15 @@ pub fn reconcile_strategic_directive(
                 };
             }
         }
+        JointCapitalAction::MaintenanceAndRdOverhaul { overhaul_cost, .. } => {
+            if *overhaul_cost <= free_cash_above_floor && overhaul_cost.is_positive() {
+                cash_after_capex = free_cash_above_floor.checked_sub(*overhaul_cost)?;
+            } else {
+                directive.capital_action = JointCapitalAction::HoldAndDelever {
+                    repay_amount: Money::ZERO,
+                };
+            }
+        }
     }
 
     if cash_after_capex.is_zero() {

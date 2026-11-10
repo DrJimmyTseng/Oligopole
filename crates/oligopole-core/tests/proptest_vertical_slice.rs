@@ -523,3 +523,74 @@ fn test_all_six_black_tape_invariant_guards_and_sme_ipo_pipeline() {
     assert!(world.order_books.contains_key(bolt_eq_inst));
     world.audit_world_invariants().unwrap();
 }
+
+
+#[test]
+fn test_vertical_slice_0_facility_maintenance_credit_ratings_news_and_cap_table() {
+    let (mut world, handles) = build_vertical_slice_0([88u8; 32]).unwrap();
+    let plyr_id = handles.player_retail_corp;
+    let iron_id = handles.iron_corp;
+
+    // 1. Run 30 Fast Ticks (1 simulated month) so extractors wear down facility condition
+    for _ in 0..30 {
+        world.step_fast_tick(&[]).unwrap();
+    }
+
+    let iron_cond_after_30d = world
+        .corporations
+        .get(iron_id)
+        .unwrap()
+        .facility_condition_bps;
+    assert!(
+        iron_cond_after_30d < 10_000,
+        "daily extraction should wear down facility_condition_bps below 10_000 (got {iron_cond_after_30d})"
+    );
+
+    // 2. Execute Maintenance & R&D Overhaul on IRON Corp and verify condition + quality boost
+    let iron_qual_before = world.corporations.get(iron_id).unwrap().quality_score_bps;
+    world
+        .execute_command(PlayerCommand::ExecuteFacilityMaintenance { corp_id: iron_id })
+        .unwrap();
+    let iron_after = world.corporations.get(iron_id).unwrap();
+    assert_eq!(iron_after.facility_condition_bps, 10_000);
+    assert_eq!(iron_after.quality_score_bps, iron_qual_before + 200);
+
+    // 3. Draw a large bank loan on PLYR right before month-end (Tick 60) to trigger credit rating downgrade
+    while world.current_tick.0 < 59 {
+        world.step_fast_tick(&[]).unwrap();
+    }
+    world
+        .step_fast_tick(&[PlayerCommand::RequestBankLoan {
+            corp_id: plyr_id,
+            principal: Money::from_dollars(1_200_000),
+        }])
+        .unwrap();
+    let plyr_rating = world.corporations.get(plyr_id).unwrap().credit_rating;
+    assert_ne!(
+        plyr_rating,
+        oligopole_core::CreditRating::AAA,
+        "corporation with $1.2M debt should be downgraded from AAA at month-end"
+    );
+
+    // 4. Advance to Quarter-End (Tick 90) and verify WorldView macro telemetry, Cap Table, and News Wire
+    while !world.current_tick.is_quarter_end() {
+        world.step_fast_tick(&[]).unwrap();
+    }
+    let view = world.build_world_view().unwrap();
+    assert!(view.macro_telemetry.retail_cpi_index_bps > 0);
+    assert!(view.macro_telemetry.trailing_30d_gdp.is_positive());
+    assert!(view.macro_telemetry.extractor_hhi > 0);
+    assert!(
+        !view.news_feed.is_empty(),
+        "news wire should contain corporate headlines after 90 ticks"
+    );
+
+    let plyr_snap = view
+        .corporations
+        .iter()
+        .find(|c| c.corp_id == plyr_id)
+        .unwrap();
+    let cap_shares_sum: u64 = plyr_snap.cap_table.iter().map(|r| r.owned_shares).sum();
+    assert_eq!(cap_shares_sum, plyr_snap.total_shares_outstanding);
+    world.audit_world_invariants().unwrap();
+}

@@ -35,11 +35,14 @@ pub use household::{
 };
 pub use ids::{CohortId, ContractId, CorpId, InstrumentId, OrderId, ShortLoanId, SkuId, WireMessageId};
 pub use production::{
-    AiDelegationConfig, CloudTier, Corporation, CorporationRole, ExecutivePersonaKind,
-    SkuDefinition,
+    AiDelegationConfig, CloudTier, Corporation, CorporationRole, CreditRating,
+    ExecutivePersonaKind, SkuDefinition,
 };
 pub use retail_market::{RetailSaleSettlement, compute_retail_clearing_plan};
-pub use snapshot::{CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, WorldView};
+pub use snapshot::{
+    CohortSnapshot, CorporationSnapshot, InstrumentSnapshot, MacroTelemetrySnapshot, NewsCategory,
+    NewsHeadline, ShareholderRecord, WorldView,
+};
 pub use vertical_slice::{VerticalSliceHandles, build_vertical_slice_0};
 pub use wire::{
     ClientWireFrame, ClobDeltaEvent, CrimeOperationKind, MAX_RESOLVED_WIRE_MESSAGES_PER_CORP,

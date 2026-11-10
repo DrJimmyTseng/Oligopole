@@ -3,11 +3,76 @@ use crate::calendar::{Date360, Tick};
 use crate::clob::{InstrumentKind, OhlcvBar, OrderBookDepthLevel, TradeFill};
 use crate::household::HouseholdCohortKind;
 use crate::ids::{CohortId, CorpId, InstrumentId, SkuId};
-use crate::production::{AiDelegationConfig, CloudTier, CorporationRole, ExecutivePersonaKind};
+use crate::production::{
+    AiDelegationConfig, CloudTier, CorporationRole, CreditRating, ExecutivePersonaKind,
+};
 use crate::wire::{ShortPositionRecord, WireMessage};
 use oligopole_ledger::{EntityId, FinancialStatementReport, Money, WacInventoryLot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Category tag for a live Bloomberg corporate/macro news wire headline (`NEWS <GO>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NewsCategory {
+    CapExAndExpansion,
+    RdAndMaintenance,
+    CreditAndDebt,
+    DividendAndBuyback,
+    QuarterlyEarnings,
+}
+
+impl NewsCategory {
+    #[inline]
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            Self::CapExAndExpansion => "CAPEX",
+            Self::RdAndMaintenance => "R&D/MAINT",
+            Self::CreditAndDebt => "CREDIT",
+            Self::DividendAndBuyback => "CAPITAL",
+            Self::QuarterlyEarnings => "EARNINGS",
+        }
+    }
+}
+
+/// A timestamped deterministic headline recorded on the simulation's Bloomberg News Wire (`NEWS <GO>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewsHeadline {
+    pub seq_id: u64,
+    pub tick: Tick,
+    pub date: Date360,
+    pub ticker: String,
+    pub category: NewsCategory,
+    pub headline: String,
+}
+
+/// Per-shareholder ownership breakdown row for the Cap Table Inspector (`CAP <GO>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareholderRecord {
+    pub holder_entity_id: EntityId,
+    pub holder_name: String,
+    pub owned_shares: u64,
+    pub reserved_shares: u64,
+    pub ownership_bps: u32,
+}
+
+/// Macroeconomic & industrial concentration telemetry for the `ECO <GO>` dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacroTelemetrySnapshot {
+    /// Retail Consumer Price Index in basis points (`10_000 = 100.0` baseline).
+    pub retail_cpi_index_bps: u32,
+    /// Trailing 30-day gross trade & retail transaction velocity (`GDP` proxy).
+    pub trailing_30d_gdp: Money,
+    /// Average physical plant condition across all corporations (`3_500..=10_000 bps`).
+    pub avg_facility_condition_bps: u32,
+    /// Average product quality score across all corporations (`bps`).
+    pub avg_quality_score_bps: u32,
+    /// Herfindahl-Hirschman Index (`0..=10_000`) for the Resource Extraction sector.
+    pub extractor_hhi: u32,
+    /// Herfindahl-Hirschman Index (`0..=10_000`) for the Manufacturing sector.
+    pub manufacturer_hhi: u32,
+    /// Herfindahl-Hirschman Index (`0..=10_000`) for the B2C Retail sector.
+    pub retail_hhi: u32,
+}
 
 /// Read-only projection of a tradable CLOB instrument for the 120 FPS `egui` terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +110,12 @@ pub struct CorporationSnapshot {
     pub service_credits: u64,
     pub cloud_tier: CloudTier,
     pub subscribed_cloud_tier: CloudTier,
+    pub credit_rating: CreditRating,
+    pub effective_loan_rate_bps: u32,
     pub loans_payable: Money,
     pub daily_capacity: u64,
+    pub effective_daily_capacity: u64,
+    pub facility_condition_bps: u32,
     pub daily_wage_bill: Money,
     pub daily_manager_bill: Money,
     pub posted_selling_price: Money,
@@ -65,6 +134,7 @@ pub struct CorporationSnapshot {
     pub ransomware_degraded_until_tick: u64,
     pub security_shield_until_tick: u64,
     pub logistics_shield_until_tick: u64,
+    pub cap_table: Vec<ShareholderRecord>,
     pub inventory: BTreeMap<SkuId, WacInventoryLot>,
     pub financial_statement: FinancialStatementReport,
 }
@@ -98,11 +168,13 @@ pub struct WorldView {
     pub total_m1_money_supply: Money,
     pub total_bank_loans: Money,
     pub total_service_credits_supply: u64,
+    pub macro_telemetry: MacroTelemetrySnapshot,
     pub corporations: Vec<CorporationSnapshot>,
     pub cohorts: Vec<CohortSnapshot>,
     pub instruments: Vec<InstrumentSnapshot>,
     pub active_b2b_contracts: Vec<B2BSupplyContract>,
     pub wire_messages: Vec<WireMessage>,
     pub visible_short_positions: Vec<ShortPositionRecord>,
+    pub news_feed: Vec<NewsHeadline>,
     pub sku_codes: BTreeMap<SkuId, String>,
 }

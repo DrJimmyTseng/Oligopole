@@ -86,6 +86,75 @@ impl CloudTier {
     }
 }
 
+/// Institutional corporate credit rating tier determining borrowing spread over the bank's base rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+pub enum CreditRating {
+    #[default]
+    AAA,
+    AA,
+    A,
+    BBB,
+    BB,
+    CCC,
+}
+
+impl CreditRating {
+    #[inline]
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            Self::AAA => "AAA",
+            Self::AA => "AA",
+            Self::A => "A",
+            Self::BBB => "BBB",
+            Self::BB => "BB (HY)",
+            Self::CCC => "CCC (DISTRESSED)",
+        }
+    }
+
+    /// Credit spread in basis points added on top of `bank.default_loan_rate_bps`.
+    #[inline]
+    pub const fn spread_bps(self) -> u32 {
+        match self {
+            Self::AAA => 0,
+            Self::AA => 40,
+            Self::A => 90,
+            Self::BBB => 160,
+            Self::BB => 275,
+            Self::CCC => 450,
+        }
+    }
+
+    /// Evaluates a corporation's institutional credit rating from its available cash,
+    /// 20-day working-capital floor, outstanding debt, and GAAP book equity.
+    pub fn evaluate(
+        available_cash: Money,
+        working_floor_20d: Money,
+        outstanding_debt: Money,
+        total_equity: Money,
+    ) -> Self {
+        if total_equity <= Money::ZERO || available_cash.cents() * 4 < working_floor_20d.cents() {
+            return Self::CCC;
+        }
+        let debt_c = outstanding_debt.cents().max(0);
+        let eq_c = total_equity.cents().max(1);
+        let dte_bps = (debt_c * 10_000) / eq_c;
+
+        if debt_c == 0 && available_cash >= working_floor_20d {
+            Self::AAA
+        } else if dte_bps <= 2_500 && available_cash >= working_floor_20d {
+            Self::AA
+        } else if dte_bps <= 5_500 && available_cash.cents() * 2 >= working_floor_20d.cents() {
+            Self::A
+        } else if dte_bps <= 10_000 && available_cash.cents() * 2 >= working_floor_20d.cents() {
+            Self::BBB
+        } else if dte_bps <= 18_000 {
+            Self::BB
+        } else {
+            Self::CCC
+        }
+    }
+}
+
 /// Executive persona archetype distinguishing corporate leadership behavior across the 6 firms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ExecutivePersonaKind {
@@ -215,6 +284,10 @@ pub struct Corporation {
     pub security_shield_until_tick: u64,
     /// Tick until which an active `LogisticsTrucking` retainer shields B2B cargo deliveries.
     pub logistics_shield_until_tick: u64,
+    /// Physical facility condition in basis points (`3_500..=10_000`), scaling effective daily capacity.
+    pub facility_condition_bps: u32,
+    /// Institutional credit rating (`AAA`..=`CCC`) governing dynamic commercial bank loan spreads.
+    pub credit_rating: CreditRating,
 }
 
 impl Corporation {
@@ -224,6 +297,16 @@ impl Corporation {
 
     pub fn inventory_lot_mut(&mut self, sku_id: SkuId) -> &mut WacInventoryLot {
         self.inventory.entry(sku_id).or_default()
+    }
+
+    /// Effective daily production/extraction capacity scaled by `facility_condition_bps` (`>= 1` when `daily_capacity > 0`).
+    #[inline]
+    pub fn effective_daily_capacity(&self) -> u64 {
+        if self.daily_capacity == 0 {
+            return 0;
+        }
+        let cond = u64::from(self.facility_condition_bps.clamp(3_500, 10_000));
+        ((self.daily_capacity.saturating_mul(cond) + 5_000) / 10_000).max(1)
     }
 
     /// Computes the corporation's N-day working-capital floor (`days * (daily_wage_bill + daily_manager_bill + daily_loan_interest)`).

@@ -5,8 +5,9 @@ use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use oligopole_core::{
-    CloudTier, CorporationRole, CorporationSnapshot, CrimeOperationKind, InstrumentKind,
-    InstrumentSnapshot, OrderSide, PlayerCommand, WireAttachment, WireAttachmentStatus, WorldView,
+    CloudTier, CorporationRole, CorporationSnapshot, CreditRating, CrimeOperationKind,
+    InstrumentKind, InstrumentSnapshot, NewsCategory, OrderSide, PlayerCommand, WireAttachment,
+    WireAttachmentStatus, WorldView,
 };
 use oligopole_ledger::{Money, StandardAccountCode};
 use tokio::sync::mpsc;
@@ -78,6 +79,9 @@ impl TerminalPane {
             TerminalMnemonic::OperationsDag => "OPS • SUPPLY DAG",
             TerminalMnemonic::ExecutiveTicket => "EX • EXEC TICKET",
             TerminalMnemonic::CorporateWire => "MSG • CORPORATE WIRE",
+            TerminalMnemonic::MacroEconomy => "ECO • MACRO & CREDIT",
+            TerminalMnemonic::CapTable => "CAP • CAP TABLE",
+            TerminalMnemonic::NewsWire => "NEWS • WIRE",
         };
         format!("[{}] {ticker} — {mnem}", self.channel.badge_label())
     }
@@ -136,6 +140,16 @@ impl TerminalPane {
             TerminalMnemonic::CorporateWire => {
                 let ticker = self.active_ticker(registry);
                 self.render_corporate_wire(ui, view, &ticker, cmd_tx);
+            }
+            TerminalMnemonic::MacroEconomy => {
+                Self::render_macro_economy(ui, view, self.channel, registry);
+            }
+            TerminalMnemonic::CapTable => {
+                let ticker = self.active_ticker(registry);
+                Self::render_cap_table(ui, view, &ticker);
+            }
+            TerminalMnemonic::NewsWire => {
+                Self::render_news_wire(ui, view, self.channel, registry);
             }
         }
     }
@@ -445,6 +459,7 @@ impl TerminalPane {
                     StandardAccountCode::TaxAndFineExpense,
                     StandardAccountCode::CloudServiceExpense,
                     StandardAccountCode::SecurityAndFreightExpense,
+                    StandardAccountCode::DepreciationExpense,
                 ] {
                     let bal = st.line_items.get(&code).copied().unwrap_or(Money::ZERO);
                     body.row(18.0, |mut row| {
@@ -504,10 +519,13 @@ impl TerminalPane {
                 "UNSHIELDED"
             };
             let info = format!(
-                "{} ({})\nCap: {}/d\nPx: {}\nWAC Qty: {}\n{}",
+                "{} ({})\nEff {}/d ({:.0}%)\nRating: {} ({:.2}%)\nPx: {} | WAC: {}\n{}",
                 corp.ticker,
                 corp.cloud_tier.badge_label(),
-                corp.daily_capacity,
+                corp.effective_daily_capacity,
+                f64::from(corp.facility_condition_bps) / 100.0,
+                corp.credit_rating.badge_label(),
+                f64::from(corp.effective_loan_rate_bps) / 100.0,
                 corp.posted_selling_price,
                 total_inv_units,
                 shield_tag
@@ -550,6 +568,17 @@ impl TerminalPane {
                         .strong(),
                 );
                 ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "RATING: {} ({:.2}% Loan Rate) | CONDITION: {:.1}%",
+                        corp.credit_rating.badge_label(),
+                        f64::from(corp.effective_loan_rate_bps) / 100.0,
+                        f64::from(corp.facility_condition_bps) / 100.0,
+                    ))
+                    .color(EMERALD_ACCENT)
+                    .strong(),
+                );
+                ui.separator();
                 ui.label(format!(
                     "Shares Out: {} | Mkt Cap: {} | SC: {}",
                     corp.total_shares_outstanding, corp.market_cap, corp.service_credits
@@ -571,6 +600,33 @@ impl TerminalPane {
                     let _ = cmd_tx.send(PlayerCommand::SetCorporationPrice {
                         corp_id: corp.corp_id,
                         new_price: new_px,
+                    });
+                }
+                ui.separator();
+                if ui
+                    .button(
+                        RichText::new("🔧 Maint & R&D Overhaul ($18k)")
+                            .color(EMERALD_ACCENT)
+                            .strong(),
+                    )
+                    .on_hover_text(
+                        "Restores +15% facility condition and permanently boosts product quality by +200 bps",
+                    )
+                    .clicked()
+                {
+                    let _ = cmd_tx.send(PlayerCommand::ExecuteFacilityMaintenance {
+                        corp_id: corp.corp_id,
+                    });
+                }
+                if ui
+                    .button(RichText::new("🏗 Expand Capacity (+5/d, $45k)").color(AMBER_PRIMARY))
+                    .clicked()
+                {
+                    let _ = cmd_tx.send(PlayerCommand::ExpandFacilityCapacity {
+                        corp_id: corp.corp_id,
+                        added_capacity: 5,
+                        capex_cost: Money::from_dollars(45_000),
+                        debt_funded: false,
                     });
                 }
             });
@@ -963,6 +1019,270 @@ impl TerminalPane {
                             });
                         }
                     }
+                });
+            }
+        });
+    }
+
+    fn render_macro_economy(
+        ui: &mut Ui,
+        view: &WorldView,
+        target_channel: LinkChannel,
+        registry: &mut ChannelLinkRegistry,
+    ) {
+        let m = &view.macro_telemetry;
+        ui.label(
+            RichText::new("MACROECONOMIC TELEMETRY, SECTOR HHI CONCENTRATION & CREDIT RATINGS (`ECO`)")
+                .color(AMBER_PRIMARY)
+                .strong(),
+        );
+
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                CYAN_ACCENT,
+                format!(
+                    "Retail CPI Index: {:.2} (Base 100.00)",
+                    f64::from(m.retail_cpi_index_bps) / 100.0,
+                ),
+            );
+            ui.separator();
+            ui.colored_label(
+                EMERALD_ACCENT,
+                format!("Trailing 30D GDP Velocity: {}", m.trailing_30d_gdp),
+            );
+            ui.separator();
+            ui.label(format!(
+                "Base Bank Rate: {:.2}% | Avg Plant Cond: {:.1}% | Avg Quality: {:.1}%",
+                f64::from(view.bank_loan_rate_bps) / 100.0,
+                f64::from(m.avg_facility_condition_bps) / 100.0,
+                f64::from(m.avg_quality_score_bps) / 100.0,
+            ));
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Herfindahl-Hirschman Index (0..10,000) — Mining HHI: {} | Manufacturing HHI: {} | Retail HHI: {}",
+                    m.extractor_hhi, m.manufacturer_hhi, m.retail_hhi
+                ))
+                .color(TEXT_MUTED),
+            );
+        });
+
+        ui.separator();
+        ui.label(
+            RichText::new("CORPORATE CREDIT RATINGS, LOAN SPREADS & PHYSICAL PLANT CONDITION")
+                .color(CYAN_ACCENT)
+                .strong(),
+        );
+
+        let ch = if target_channel == LinkChannel::Unlinked {
+            LinkChannel::ChannelA
+        } else {
+            target_channel
+        };
+
+        TableBuilder::new(ui)
+            .id_salt("eco_credit_table")
+            .striped(true)
+            .column(Column::initial(65.0))
+            .column(Column::initial(65.0))
+            .column(Column::initial(75.0))
+            .column(Column::initial(85.0))
+            .column(Column::initial(95.0))
+            .column(Column::initial(95.0))
+            .column(Column::remainder())
+            .header(18.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("TICKER");
+                });
+                h.col(|ui| {
+                    ui.strong("RATING");
+                });
+                h.col(|ui| {
+                    ui.strong("LOAN %");
+                });
+                h.col(|ui| {
+                    ui.strong("CONDITION");
+                });
+                h.col(|ui| {
+                    ui.strong("EFF CAP");
+                });
+                h.col(|ui| {
+                    ui.strong("DEBT");
+                });
+                h.col(|ui| {
+                    ui.strong("EQUITY");
+                });
+            })
+            .body(|mut body| {
+                for corp in &view.corporations {
+                    body.row(19.0, |mut row| {
+                        row.col(|ui| {
+                            if ui
+                                .button(RichText::new(&corp.ticker).color(AMBER_PRIMARY).strong())
+                                .clicked()
+                            {
+                                registry.set_ticker(ch, corp.ticker.clone());
+                            }
+                        });
+                        row.col(|ui| {
+                            let r_color = match corp.credit_rating {
+                                CreditRating::AAA | CreditRating::AA => BID_GREEN,
+                                CreditRating::A | CreditRating::BBB => CYAN_ACCENT,
+                                CreditRating::BB => AMBER_PRIMARY,
+                                CreditRating::CCC => ASK_RED,
+                            };
+                            ui.colored_label(r_color, corp.credit_rating.badge_label());
+                        });
+                        row.col(|ui| {
+                            ui.label(format!(
+                                "{:.2}%",
+                                f64::from(corp.effective_loan_rate_bps) / 100.0
+                            ));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!(
+                                "{:.1}%",
+                                f64::from(corp.facility_condition_bps) / 100.0
+                            ));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!(
+                                "{}/{} u/d",
+                                corp.effective_daily_capacity, corp.daily_capacity
+                            ));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{}", corp.loans_payable));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!(
+                                "{}",
+                                corp.financial_statement.total_equity_including_net_income
+                            ));
+                        });
+                    });
+                }
+            });
+    }
+
+    fn render_cap_table(ui: &mut Ui, view: &WorldView, ticker: &str) {
+        let Some(corp) = Self::find_corporation(view, ticker) else {
+            ui.label("Select a corporation to inspect its Cap Table.");
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} ({}) — SHAREHOLDER OWNERSHIP & CAP TABLE (`CAP`)",
+                    corp.name, corp.ticker
+                ))
+                .color(AMBER_PRIMARY)
+                .strong(),
+            );
+            ui.separator();
+            ui.colored_label(
+                EMERALD_ACCENT,
+                format!(
+                    "Total Shares: {} | Share Px: {} | Market Cap: {}",
+                    corp.total_shares_outstanding, corp.share_price, corp.market_cap
+                ),
+            );
+        });
+
+        TableBuilder::new(ui)
+            .id_salt("cap_table_grid")
+            .striped(true)
+            .column(Column::initial(220.0))
+            .column(Column::initial(95.0))
+            .column(Column::initial(95.0))
+            .column(Column::remainder())
+            .header(18.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("HOLDER ENTITY");
+                });
+                h.col(|ui| {
+                    ui.strong("OWNED SHARES");
+                });
+                h.col(|ui| {
+                    ui.strong("ESCROWED (ASK)");
+                });
+                h.col(|ui| {
+                    ui.strong("OWNERSHIP %");
+                });
+            })
+            .body(|mut body| {
+                for holder in &corp.cap_table {
+                    body.row(19.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(&holder.holder_name);
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{}", holder.owned_shares));
+                        });
+                        row.col(|ui| {
+                            ui.colored_label(TEXT_MUTED, format!("{}", holder.reserved_shares));
+                        });
+                        row.col(|ui| {
+                            ui.colored_label(
+                                CYAN_ACCENT,
+                                format!("{:.2}%", f64::from(holder.ownership_bps) / 100.0),
+                            );
+                        });
+                    });
+                }
+            });
+    }
+
+    fn render_news_wire(
+        ui: &mut Ui,
+        view: &WorldView,
+        target_channel: LinkChannel,
+        registry: &mut ChannelLinkRegistry,
+    ) {
+        ui.label(
+            RichText::new(
+                "LIVE BLOOMBERG FINANCIAL NEWS WIRE (`NEWS`) • EARNINGS, RATINGS, CAPEX & DIVIDENDS",
+            )
+            .color(AMBER_PRIMARY)
+            .strong(),
+        );
+        ui.separator();
+
+        let ch = if target_channel == LinkChannel::Unlinked {
+            LinkChannel::ChannelA
+        } else {
+            target_channel
+        };
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if view.news_feed.is_empty() {
+                ui.colored_label(
+                    TEXT_MUTED,
+                    "No headlines published yet — advance ticks to generate corporate filings and rating alerts.",
+                );
+                return;
+            }
+            for item in view.news_feed.iter().rev() {
+                let cat_color = match item.category {
+                    NewsCategory::QuarterlyEarnings => EMERALD_ACCENT,
+                    NewsCategory::CreditAndDebt => ASK_RED,
+                    NewsCategory::CapExAndExpansion => CYAN_ACCENT,
+                    NewsCategory::RdAndMaintenance => AMBER_PRIMARY,
+                    NewsCategory::DividendAndBuyback => BID_GREEN,
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(TEXT_MUTED, format!("{} (T{:04})", item.date, item.tick.0));
+                    ui.colored_label(cat_color, format!("[{}]", item.category.badge_label()));
+                    if ui
+                        .small_button(RichText::new(&item.ticker).color(AMBER_PRIMARY).strong())
+                        .clicked()
+                    {
+                        registry.set_ticker(ch, item.ticker.clone());
+                    }
+                    ui.label(&item.headline);
                 });
             }
         });

@@ -92,6 +92,14 @@ pub enum JointCapitalAction {
         shares_to_issue: u64,
         min_ask_price: Money,
     },
+    /// Execute a plant maintenance & R&D overhaul (`DepreciationExpense`), restoring `facility_condition_bps`
+    /// and boosting `quality_score_bps`.
+    MaintenanceAndRdOverhaul {
+        overhaul_cost: Money,
+        condition_restore_bps: u32,
+        quality_boost_bps: u32,
+        estimated_npv: Money,
+    },
 }
 
 /// Complete monthly Slow-Tick strategic directive package for a single `CorpId`,
@@ -225,5 +233,10 @@ pub enum PlayerCommand {
         responder_corp_id: CorpId,
         message_id: WireMessageId,
         accept: bool,
+    },
+    /// Execute an immediate plant maintenance & R&D overhaul (`$18,000` cash -> `WageEarners` & `ManagersSkilled`,
+    /// restoring `+1,500 bps` `facility_condition_bps` and `+200 bps` `quality_score_bps`).
+    ExecuteFacilityMaintenance {
+        corp_id: CorpId,
     },
 }

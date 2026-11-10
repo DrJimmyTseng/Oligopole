@@ -15,10 +15,16 @@ pub enum TerminalMnemonic {
     ExecutiveTicket,
     /// `MSG`: Instant Bloomberg / Corporate Wire & Smart Attachments (`F7`).
     CorporateWire,
+    /// `ECO`: Macroeconomic Telemetry, Credit Ratings & Sector Concentration (`F8`).
+    MacroEconomy,
+    /// `CAP`: Shareholder Cap Table & Ownership Inspector (`F9`).
+    CapTable,
+    /// `NEWS`: Live Bloomberg Corporate & Financial News Wire (`F10`).
+    NewsWire,
 }
 
 impl TerminalMnemonic {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::MarketMonitor,
         Self::GraphPrice,
         Self::OrderBook,
@@ -26,6 +32,9 @@ impl TerminalMnemonic {
         Self::OperationsDag,
         Self::ExecutiveTicket,
         Self::CorporateWire,
+        Self::MacroEconomy,
+        Self::CapTable,
+        Self::NewsWire,
     ];
 
     #[inline]
@@ -38,6 +47,9 @@ impl TerminalMnemonic {
             Self::OperationsDag => "OPS",
             Self::ExecutiveTicket => "EX",
             Self::CorporateWire => "MSG",
+            Self::MacroEconomy => "ECO",
+            Self::CapTable => "CAP",
+            Self::NewsWire => "NEWS",
         }
     }
 }
@@ -50,7 +62,7 @@ pub struct ParsedTerminalCommand {
     pub mnemonic: TerminalMnemonic,
 }
 
-/// Parses a Bloomberg command string such as `"IRON CMDTY GP"`, `"GOOGL-DR EQ OB"`, `"PLEX SC OB"`, `"PLYR MSG"`, or `"APEX OPS"`.
+/// Parses a Bloomberg command string such as `"IRON CMDTY GP"`, `"GOOGL-DR EQ OB"`, `"PLEX SC OB"`, `"PLYR MSG"`, `"ECO"`, `"NEWS"`, or `"APEX OPS"`.
 pub fn parse_bloomberg_command(input: &str) -> Option<ParsedTerminalCommand> {
     let tokens: Vec<String> = input
         .split_whitespace()
@@ -71,9 +83,27 @@ pub fn parse_bloomberg_command(input: &str) -> Option<ParsedTerminalCommand> {
         "OPS" | "DAG" | "SCM" => TerminalMnemonic::OperationsDag,
         "EX" | "TRD" | "ORD" => TerminalMnemonic::ExecutiveTicket,
         "MSG" | "WIRE" | "IB" => TerminalMnemonic::CorporateWire,
+        "ECO" | "MACRO" | "GDP" | "CPI" => TerminalMnemonic::MacroEconomy,
+        "CAP" | "HOLDERS" | "OWN" | "HLD" => TerminalMnemonic::CapTable,
+        "NEWS" | "N" | "TOP" => TerminalMnemonic::NewsWire,
         _ if tokens.len() == 1 => TerminalMnemonic::FinancialAnalysis,
         _ => return None,
     };
+
+    if tokens.len() == 1
+        && matches!(
+            mnemonic,
+            TerminalMnemonic::MacroEconomy
+                | TerminalMnemonic::NewsWire
+                | TerminalMnemonic::MarketMonitor
+                | TerminalMnemonic::OperationsDag
+        )
+    {
+        return Some(ParsedTerminalCommand {
+            ticker: "PLYR".to_owned(),
+            mnemonic,
+        });
+    }
 
     // Preserve explicit market sector qualification (`CMDTY`, `EQ`, `SC`) so `IRON CMDTY OB`, `IRON EQ OB`,
     // `GOOGL-DR EQ OB`, and `PLEX SC OB` route to the exact order book!
@@ -159,6 +189,27 @@ mod tests {
             Some(ParsedTerminalCommand {
                 ticker: "ZENI".to_owned(),
                 mnemonic: TerminalMnemonic::OperationsDag,
+            })
+        );
+        assert_eq!(
+            parse_bloomberg_command("ECO"),
+            Some(ParsedTerminalCommand {
+                ticker: "PLYR".to_owned(),
+                mnemonic: TerminalMnemonic::MacroEconomy,
+            })
+        );
+        assert_eq!(
+            parse_bloomberg_command("ACME CAP"),
+            Some(ParsedTerminalCommand {
+                ticker: "ACME".to_owned(),
+                mnemonic: TerminalMnemonic::CapTable,
+            })
+        );
+        assert_eq!(
+            parse_bloomberg_command("NEWS"),
+            Some(ParsedTerminalCommand {
+                ticker: "PLYR".to_owned(),
+                mnemonic: TerminalMnemonic::NewsWire,
             })
         );
     }

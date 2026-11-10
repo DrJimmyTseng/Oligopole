@@ -3,8 +3,8 @@ use crate::error::CoreError;
 use crate::household::{HouseholdCohort, HouseholdCohortKind};
 use crate::ids::{CohortId, CorpId, InstrumentId, SkuId};
 use crate::production::{
-    AiDelegationConfig, CloudTier, Corporation, CorporationRole, ExecutivePersonaKind,
-    SkuDefinition,
+    AiDelegationConfig, CloudTier, Corporation, CorporationRole, CreditRating,
+    ExecutivePersonaKind, SkuDefinition,
 };
 use crate::wire::ServiceCreditPosition;
 use crate::world::{EquityPosition, WorldState};
@@ -469,6 +469,8 @@ fn register_slice_corporation(
         ransomware_degraded_until_tick: 0,
         security_shield_until_tick: 0,
         logistics_shield_until_tick: 0,
+        facility_condition_bps: 10_000,
+        credit_rating: CreditRating::AAA,
     });
 
     let eq_ticker = format!("{ticker} EQ");
