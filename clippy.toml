@@ -1,0 +1,4 @@
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Use std::collections::BTreeMap or slotmap::SlotMap for deterministic iteration and postcard + blake3 serialization." },
+    { path = "std::collections::HashSet", reason = "Use std::collections::BTreeSet for deterministic iteration and postcard + blake3 serialization." },
+]

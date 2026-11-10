@@ -1,0 +1,21 @@
+[package]
+name = "oligopole-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+oligopole-ledger = { workspace = true }
+oligopole-core = { workspace = true }
+oligopole-ai = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_tiles = { workspace = true }
+egui_plot = { workspace = true }
+egui_extras = { workspace = true }
+tokio = { workspace = true }
+rust_decimal = { workspace = true }

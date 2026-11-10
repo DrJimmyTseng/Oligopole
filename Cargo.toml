@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oligopole-ledger",
+    "crates/oligopole-core",
+    "crates/oligopole-ai",
+    "crates/oligopole-store",
+    "crates/oligopole-ui",
+    "crates/oligopole-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/DrJimmyTseng/Oligopole"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+fallible_impl_from = "deny"
+float_cmp = "deny"
+lossy_float_literal = "deny"
+disallowed_types = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[workspace.dependencies]
+oligopole-ledger = { path = "crates/oligopole-ledger" }
+oligopole-core = { path = "crates/oligopole-core" }
+oligopole-ai = { path = "crates/oligopole-ai" }
+oligopole-store = { path = "crates/oligopole-store" }
+oligopole-ui = { path = "crates/oligopole-ui" }
+
+slotmap = { version = "1.0", features = ["serde"] }
+rust_decimal = { version = "1.36", features = ["serde", "maths"] }
+rust_decimal_macros = "1.36"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc", "use-std"] }
+rmp-serde = "1.3"
+zstd = "0.13"
+blake3 = "1.5"
+thiserror = "2.0"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand_chacha = { version = "0.3", features = ["serde1"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.31"
+egui_tiles = "0.12"
+egui_plot = "0.31"
+egui_extras = { version = "0.31", features = ["all_loaders"] }
+proptest = "1.6"
